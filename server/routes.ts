@@ -58,12 +58,12 @@ async function fetchKalshiMarkets(status: string, limit: number): Promise<Kalshi
       ticker: m.ticker || "",
       status: m.status || "",
       close_time: m.close_time || "",
-      yes_bid: parseDollars(m.yes_bid) ?? parseDollars(m.yes_sub_title) ?? 50,
-      yes_ask: parseDollars(m.yes_ask) ?? 50,
-      no_bid: parseDollars(m.no_bid) ?? 50,
-      no_ask: parseDollars(m.no_ask) ?? 50,
-      volume: parseFloat(m.volume || m.volume_fp || "0") || 0,
-      result: m.result || null,
+      yes_bid: parseDollars(m.yes_bid_dollars) ?? parseDollars(m.yes_bid) ?? 50,
+      yes_ask: parseDollars(m.yes_ask_dollars) ?? parseDollars(m.yes_ask) ?? 50,
+      no_bid: parseDollars(m.no_bid_dollars) ?? parseDollars(m.no_bid) ?? 50,
+      no_ask: parseDollars(m.no_ask_dollars) ?? parseDollars(m.no_ask) ?? 50,
+      volume: parseFloat(m.volume_fp || m.volume || "0") || 0,
+      result: m.result && m.result !== "" ? m.result : null,
     }));
   } catch {
     return [];

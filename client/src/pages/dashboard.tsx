@@ -211,10 +211,10 @@ function BTCChart({ prices }: { prices: [number, number][] }) {
             <YAxis
               domain={[minPrice - padding, maxPrice + padding]}
               tick={{ fill: "#64748b", fontSize: 10 }}
-              tickFormatter={(v) => `$${v.toLocaleString()}`}
+              tickFormatter={(v) => `$${Math.round(v).toLocaleString()}`}
               axisLine={false}
               tickLine={false}
-              width={70}
+              width={68}
             />
             <Tooltip
               contentStyle={{
@@ -331,7 +331,7 @@ function CurrentMarketPanel({
           <div className="flex items-center justify-between text-xs mt-auto">
             <span className="text-slate-500">Volume</span>
             <span className="text-slate-300 tabular-nums" data-testid="text-volume">
-              {market.volume.toLocaleString()}
+              {Math.round(market.volume).toLocaleString()}
             </span>
           </div>
         </>
@@ -568,11 +568,11 @@ export default function Dashboard() {
               strokeLinejoin="round"
             />
           </svg>
-          <div>
-            <h1 className="text-sm font-semibold text-slate-200 tracking-wide">
+          <div className="min-w-0">
+            <h1 className="text-sm font-semibold text-slate-200 tracking-wide whitespace-nowrap">
               KALSHI TRADING BOT
             </h1>
-            <span className="text-[10px] text-slate-500 uppercase tracking-widest">
+            <span className="text-[10px] text-slate-500 uppercase tracking-widest hidden sm:inline">
               KXBTC15M Dashboard
             </span>
           </div>
@@ -652,11 +652,13 @@ export default function Dashboard() {
                 decimals={1}
                 icon={Target}
                 trend={
-                  data.stats.win_rate >= 60
-                    ? "up"
-                    : data.stats.win_rate >= 40
-                      ? "neutral"
-                      : "down"
+                  data.stats.total_trades === 0
+                    ? "neutral"
+                    : data.stats.win_rate >= 60
+                      ? "up"
+                      : data.stats.win_rate >= 40
+                        ? "neutral"
+                        : "down"
                 }
               />
               <KPICard
@@ -664,7 +666,7 @@ export default function Dashboard() {
                 value={data.stats.total_pnl}
                 prefix="$"
                 icon={TrendingUp}
-                trend={data.stats.total_pnl >= 0 ? "up" : "down"}
+                trend={data.stats.total_pnl === 0 ? "neutral" : data.stats.total_pnl > 0 ? "up" : "down"}
                 showSign
               />
               <KPICard
@@ -678,8 +680,8 @@ export default function Dashboard() {
                 label="Daily P&L"
                 value={data.stats.daily_pnl}
                 prefix="$"
-                icon={TrendingDown}
-                trend={data.stats.daily_pnl >= 0 ? "up" : "down"}
+                icon={Activity}
+                trend={data.stats.daily_pnl === 0 ? "neutral" : data.stats.daily_pnl > 0 ? "up" : "down"}
                 showSign
               />
             </div>
