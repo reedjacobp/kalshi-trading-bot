@@ -202,11 +202,11 @@ function BTCChart({ prices }: { prices: [number, number][] }) {
               tick={{ fill: "#64748b", fontSize: 10 }}
               tickFormatter={(t) => {
                 const d = new Date(t);
-                return `${d.getHours()}:${d.getMinutes().toString().padStart(2, "0")}`;
+                return `${d.getHours()}:${d.getMinutes().toString().padStart(2, "0")}:${d.getSeconds().toString().padStart(2, "0")}`;
               }}
               axisLine={{ stroke: "#1e293b" }}
               tickLine={false}
-              minTickGap={60}
+              minTickGap={70}
             />
             <YAxis
               domain={[minPrice - padding, maxPrice + padding]}

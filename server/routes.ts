@@ -166,13 +166,16 @@ function evalConsensus(
 
   const yesPrice = yesAvg;
   
-  if (bullishVotes >= 2 && yesPrice >= 35 && yesPrice <= 57) {
-    const conf = Math.min(0.95, 0.55 + bullishVotes * 0.12);
-    return {
-      signal: "yes",
-      confidence: parseFloat(conf.toFixed(2)),
-      reason: `${bullishVotes}/3 agree YES (mom:${mom1m > 0.01 ? "Y" : "N"} prev:${previousMarketResult || "—"} skew:${yesBid > 52 ? "Y" : "N"})`,
-    };
+  if (bullishVotes >= 2) {
+    if (yesPrice >= 35 && yesPrice <= 57) {
+      const conf = Math.min(0.95, 0.55 + bullishVotes * 0.12);
+      return {
+        signal: "yes",
+        confidence: parseFloat(conf.toFixed(2)),
+        reason: `${bullishVotes}/3 agree YES (mom:${mom1m > 0.01 ? "Y" : "N"} prev:${previousMarketResult || "—"} skew:${yesBid > 52 ? "Y" : "N"})`,
+      };
+    }
+    return { signal: "none", confidence: 0, reason: `${bullishVotes}/3 bull but YES@${yesPrice.toFixed(0)}c outside 35-57c range` };
   }
 
   if (bearishVotes >= 2) {
@@ -185,6 +188,7 @@ function evalConsensus(
         reason: `${bearishVotes}/3 agree NO (mom:${mom1m < -0.01 ? "Y" : "N"} prev:${previousMarketResult || "—"} skew:${yesBid < 48 ? "Y" : "N"})`,
       };
     }
+    return { signal: "none", confidence: 0, reason: `${bearishVotes}/3 bear but NO@${noPrice.toFixed(0)}c outside 35-57c range` };
   }
 
   return { signal: "none", confidence: 0, reason: `No consensus (bull:${bullishVotes} bear:${bearishVotes})` };
