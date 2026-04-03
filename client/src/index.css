@@ -1,0 +1,242 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* KALSHI TRADING DASHBOARD — Dark terminal aesthetic */
+/* Dark navy/black surfaces, teal/cyan data, green/red for bullish/bearish */
+
+:root {
+  --button-outline: rgba(255,255,255, .10);
+  --badge-outline: rgba(255,255,255, .05);
+  --opaque-button-border-intensity: 9;
+  --elevate-1: rgba(255,255,255, .04);
+  --elevate-2: rgba(255,255,255, .09);
+
+  /* Force dark-only: near-black navy background */
+  --background: 222 47% 5%;
+  --foreground: 210 20% 90%;
+  --border: 220 20% 14%;
+  --card: 222 33% 7%;
+  --card-foreground: 210 20% 90%;
+  --card-border: 220 20% 12%;
+  --sidebar: 222 33% 8%;
+  --sidebar-foreground: 210 20% 90%;
+  --sidebar-border: 220 20% 12%;
+  --sidebar-primary: 173 80% 45%;
+  --sidebar-primary-foreground: 222 47% 5%;
+  --sidebar-accent: 220 15% 13%;
+  --sidebar-accent-foreground: 210 20% 90%;
+  --sidebar-ring: 173 80% 45%;
+  --popover: 222 33% 9%;
+  --popover-foreground: 210 20% 90%;
+  --popover-border: 220 20% 14%;
+  --primary: 173 80% 45%;
+  --primary-foreground: 222 47% 5%;
+  --secondary: 220 15% 15%;
+  --secondary-foreground: 210 20% 90%;
+  --muted: 220 15% 18%;
+  --muted-foreground: 215 12% 50%;
+  --accent: 220 15% 13%;
+  --accent-foreground: 210 20% 90%;
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 98%;
+  --input: 220 15% 22%;
+  --ring: 173 80% 45%;
+  --chart-1: 173 80% 45%;
+  --chart-2: 142 71% 45%;
+  --chart-3: 0 72% 51%;
+  --chart-4: 45 93% 60%;
+  --chart-5: 262 83% 58%;
+  --font-sans: 'Inter', 'Helvetica Neue', sans-serif;
+  --font-serif: Georgia, serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', monospace;
+  --radius: .375rem;
+  --shadow-2xs: 0px 2px 4px hsl(0 0% 0% / 0.3);
+  --shadow-xs: 0px 2px 4px hsl(0 0% 0% / 0.3);
+  --shadow-sm: 0px 1px 3px hsl(0 0% 0% / 0.3), 0px 1px 2px hsl(0 0% 0% / 0.2);
+  --shadow: 0px 2px 4px hsl(0 0% 0% / 0.3), 0px 1px 2px hsl(0 0% 0% / 0.2);
+  --shadow-md: 0px 4px 8px hsl(0 0% 0% / 0.3), 0px 2px 4px hsl(0 0% 0% / 0.2);
+  --shadow-lg: 0px 8px 16px hsl(0 0% 0% / 0.4), 0px 4px 6px hsl(0 0% 0% / 0.2);
+  --shadow-xl: 0px 16px 32px hsl(0 0% 0% / 0.4), 0px 8px 10px hsl(0 0% 0% / 0.2);
+  --shadow-2xl: 0px 24px 48px hsl(0 0% 0% / 0.5);
+  --tracking-normal: 0em;
+  --spacing: 0.25rem;
+
+  --sidebar-primary-border: hsl(var(--sidebar-primary));
+  --sidebar-accent-border: hsl(var(--sidebar-accent));
+  --primary-border: hsl(var(--primary));
+  --secondary-border: hsl(var(--secondary));
+  --muted-border: hsl(var(--muted));
+  --accent-border: hsl(var(--accent));
+  --destructive-border: hsl(var(--destructive));
+}
+
+/* No light mode — this is always dark */
+.dark {
+  --button-outline: rgba(255,255,255, .10);
+  --badge-outline: rgba(255,255,255, .05);
+  --opaque-button-border-intensity: 9;
+  --elevate-1: rgba(255,255,255, .04);
+  --elevate-2: rgba(255,255,255, .09);
+  --background: 222 47% 5%;
+  --foreground: 210 20% 90%;
+  --border: 220 20% 14%;
+  --card: 222 33% 7%;
+  --card-foreground: 210 20% 90%;
+  --card-border: 220 20% 12%;
+  --sidebar: 222 33% 8%;
+  --sidebar-foreground: 210 20% 90%;
+  --sidebar-border: 220 20% 12%;
+  --sidebar-primary: 173 80% 45%;
+  --sidebar-primary-foreground: 222 47% 5%;
+  --sidebar-accent: 220 15% 13%;
+  --sidebar-accent-foreground: 210 20% 90%;
+  --sidebar-ring: 173 80% 45%;
+  --popover: 222 33% 9%;
+  --popover-foreground: 210 20% 90%;
+  --popover-border: 220 20% 14%;
+  --primary: 173 80% 45%;
+  --primary-foreground: 222 47% 5%;
+  --secondary: 220 15% 15%;
+  --secondary-foreground: 210 20% 90%;
+  --muted: 220 15% 18%;
+  --muted-foreground: 215 12% 50%;
+  --accent: 220 15% 13%;
+  --accent-foreground: 210 20% 90%;
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 98%;
+  --input: 220 15% 22%;
+  --ring: 173 80% 45%;
+  --chart-1: 173 80% 45%;
+  --chart-2: 142 71% 45%;
+  --chart-3: 0 72% 51%;
+  --chart-4: 45 93% 60%;
+  --chart-5: 262 83% 58%;
+  --shadow-2xs: 0px 2px 4px hsl(0 0% 0% / 0.3);
+  --shadow-xs: 0px 2px 4px hsl(0 0% 0% / 0.3);
+  --shadow-sm: 0px 1px 3px hsl(0 0% 0% / 0.3), 0px 1px 2px hsl(0 0% 0% / 0.2);
+  --shadow: 0px 2px 4px hsl(0 0% 0% / 0.3), 0px 1px 2px hsl(0 0% 0% / 0.2);
+  --shadow-md: 0px 4px 8px hsl(0 0% 0% / 0.3), 0px 2px 4px hsl(0 0% 0% / 0.2);
+  --shadow-lg: 0px 8px 16px hsl(0 0% 0% / 0.4), 0px 4px 6px hsl(0 0% 0% / 0.2);
+  --shadow-xl: 0px 16px 32px hsl(0 0% 0% / 0.4), 0px 8px 10px hsl(0 0% 0% / 0.2);
+  --shadow-2xl: 0px 24px 48px hsl(0 0% 0% / 0.5);
+  --sidebar-primary-border: hsl(var(--sidebar-primary));
+  --sidebar-accent-border: hsl(var(--sidebar-accent));
+  --primary-border: hsl(var(--primary));
+  --secondary-border: hsl(var(--secondary));
+  --muted-border: hsl(var(--muted));
+  --accent-border: hsl(var(--accent));
+  --destructive-border: hsl(var(--destructive));
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply font-sans antialiased bg-background text-foreground;
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+}
+
+/* Pulsing connection dot */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.pulse-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+/* Smooth number transitions */
+.tabular-nums {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+/* Custom scrollbar for dark theme */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: hsl(222 47% 5%);
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(220 15% 20%);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(220 15% 28%);
+}
+
+@layer utilities {
+  input[type="search"]::-webkit-search-cancel-button {
+    @apply hidden;
+  }
+
+  [contenteditable][data-placeholder]:empty::before {
+    content: attr(data-placeholder);
+    color: hsl(var(--muted-foreground));
+    pointer-events: none;
+  }
+
+  .no-default-hover-elevate {}
+  .no-default-active-elevate {}
+
+  .toggle-elevate::before,
+  .toggle-elevate-2::before {
+    content: "";
+    pointer-events: none;
+    position: absolute;
+    inset: 0px;
+    border-radius: inherit;
+    z-index: -1;
+  }
+
+  .toggle-elevate.toggle-elevated::before {
+    background-color: var(--elevate-2);
+  }
+
+  .border.toggle-elevate::before {
+    inset: -1px;
+  }
+
+  .hover-elevate:not(.no-default-hover-elevate),
+  .active-elevate:not(.no-default-active-elevate),
+  .hover-elevate-2:not(.no-default-hover-elevate),
+  .active-elevate-2:not(.no-default-active-elevate) {
+    position: relative;
+    z-index: 0;
+  }
+
+  .hover-elevate:not(.no-default-hover-elevate)::after,
+  .active-elevate:not(.no-default-active-elevate)::after,
+  .hover-elevate-2:not(.no-default-hover-elevate)::after,
+  .active-elevate-2:not(.no-default-active-elevate)::after {
+    content: "";
+    pointer-events: none;
+    position: absolute;
+    inset: 0px;
+    border-radius: inherit;
+    z-index: 999;
+  }
+
+  .hover-elevate:hover:not(.no-default-hover-elevate)::after,
+  .active-elevate:active:not(.no-default-active-elevate)::after {
+    background-color: var(--elevate-1);
+  }
+
+  .hover-elevate-2:hover:not(.no-default-hover-elevate)::after,
+  .active-elevate-2:active:not(.no-default-active-elevate)::after {
+    background-color: var(--elevate-2);
+  }
+
+  .border.hover-elevate:not(.no-hover-interaction-elevate)::after,
+  .border.active-elevate:not(.no-active-interaction-elevate)::after,
+  .border.hover-elevate-2:not(.no-hover-interaction-elevate)::after,
+  .border.active-elevate-2:not(.no-active-interaction-elevate)::after {
+    inset: -1px;
+  }
+}
