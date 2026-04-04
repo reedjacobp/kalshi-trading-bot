@@ -43,15 +43,20 @@ export const tickDataSchema = z.object({
     momentum: strategySignalSchema,
     mean_reversion: strategySignalSchema,
     consensus: strategySignalSchema,
+    resolution_rider: strategySignalSchema,
+    favorite_bias: strategySignalSchema,
   }),
+  ofi: z.number(),
   trades: z.array(tradeSchema),
   stats: z.object({
     total_trades: z.number(),
+    pending: z.number(),
     wins: z.number(),
     losses: z.number(),
     win_rate: z.number(),
     total_pnl: z.number(),
     daily_pnl: z.number(),
+    bot_paused: z.boolean(),
   }),
 });
 

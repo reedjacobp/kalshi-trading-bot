@@ -9,14 +9,18 @@ let lastSettled: TickData["last_settled"] = null;
 let trades: Trade[] = [];
 let stats = {
   total_trades: 0,
+  pending: 0,
   wins: 0,
   losses: 0,
   win_rate: 0,
   total_pnl: 0,
   daily_pnl: 0,
+  bot_paused: false,
 };
 let lastTickData: TickData | null = null;
 let previousMarketResult: string | null = null;
+let botPaused = false;
+const DAILY_LOSS_LIMIT = -50; // $50
 
 // ── API Fetchers ────────────────────────────────────────────────
 async function fetchBTCPrice(): Promise<number | null> {
@@ -78,6 +82,51 @@ function parseDollars(val: any): number | null {
   // If it looks like dollar format (0.56), convert to cents
   if (num > 0 && num <= 1) return Math.round(num * 100);
   return Math.round(num);
+}
+
+// ── Order Flow Imbalance (OFI) from Crypto.com ─────────────────
+interface OrderbookLevel {
+  price: number;
+  quantity: number;
+}
+
+let lastOfi: number = 0; // cached OFI value
+
+async function fetchOFI(): Promise<number> {
+  try {
+    // Crypto.com public orderbook endpoint (no auth needed)
+    const res = await fetch("https://api.crypto.com/exchange/v1/public/get-book?instrument_name=BTC_USD&depth=10");
+    if (!res.ok) return lastOfi;
+    const data = await res.json();
+    const book = data?.result?.data?.[0] || data?.result?.data || data?.result;
+    
+    if (!book) return lastOfi;
+    
+    const bids: [number, number][] = book.bids || [];
+    const asks: [number, number][] = book.asks || [];
+    
+    // Multi-level OFI: weighted sum across depth levels (closer levels weighted more)
+    let bidVolume = 0;
+    let askVolume = 0;
+    
+    for (let i = 0; i < Math.min(bids.length, 5); i++) {
+      const weight = 1 / (i + 1); // decreasing weight with depth
+      bidVolume += parseFloat(String(bids[i][1])) * weight;
+    }
+    for (let i = 0; i < Math.min(asks.length, 5); i++) {
+      const weight = 1 / (i + 1);
+      askVolume += parseFloat(String(asks[i][1])) * weight;
+    }
+    
+    const total = bidVolume + askVolume;
+    if (total === 0) return lastOfi;
+    
+    // OFI ranges from -1 (all sell pressure) to +1 (all buy pressure)
+    lastOfi = (bidVolume - askVolume) / total;
+    return lastOfi;
+  } catch {
+    return lastOfi;
+  }
 }
 
 // ── Momentum Calculation ────────────────────────────────────────
@@ -143,15 +192,89 @@ function evalMeanReversion(
   return { signal: "none", confidence: 0, reason: "No spike detected" };
 }
 
+function evalResolutionRider(
+  secondsRemaining: number,
+  yesBid: number,
+  yesAsk: number,
+  mom1m: number
+): StrategySignal {
+  // Only fires in the last 90 seconds
+  if (secondsRemaining > 90 || secondsRemaining < 10) {
+    return { signal: "none", confidence: 0, reason: `Not in resolution window (${secondsRemaining}s left)` };
+  }
+  
+  const yesAvg = (yesBid + yesAsk) / 2;
+  
+  // If market strongly favors YES and momentum confirms
+  if (yesAvg > 60 && mom1m > 0) {
+    const conf = Math.min(0.95, 0.6 + (yesAvg - 60) / 100);
+    return {
+      signal: "yes",
+      confidence: parseFloat(conf.toFixed(2)),
+      reason: `Resolution rider: YES@${yesAvg.toFixed(0)}c with ${secondsRemaining}s left, momentum confirms`,
+    };
+  }
+  
+  // If market strongly favors NO
+  if (yesAvg < 40 && mom1m < 0) {
+    const noAvg = 100 - yesAvg;
+    const conf = Math.min(0.95, 0.6 + (noAvg - 60) / 100);
+    return {
+      signal: "no",
+      confidence: parseFloat(conf.toFixed(2)),
+      reason: `Resolution rider: NO@${noAvg.toFixed(0)}c with ${secondsRemaining}s left, momentum confirms`,
+    };
+  }
+  
+  return { signal: "none", confidence: 0, reason: `Resolution window but no strong lean (YES@${yesAvg.toFixed(0)}c, ${secondsRemaining}s)` };
+}
+
+function evalFavoriteBias(
+  yesBid: number,
+  yesAsk: number,
+  secondsRemaining: number
+): StrategySignal {
+  // Only activates in the first 10 minutes (enough time for the favorite to hold)
+  if (secondsRemaining < 180) {
+    return { signal: "none", confidence: 0, reason: "Too close to expiry for favorite bias" };
+  }
+  
+  const yesAvg = (yesBid + yesAsk) / 2;
+  
+  // Strong favorite: YES > 70c. Academic research shows favorites win MORE often than implied.
+  if (yesAvg >= 70 && yesAsk <= 80) {
+    const conf = Math.min(0.92, yesAvg / 100 + 0.05); // slightly above market-implied
+    return {
+      signal: "yes",
+      confidence: parseFloat(conf.toFixed(2)),
+      reason: `Favorite-longshot: YES@${yesAvg.toFixed(0)}c is favorite, bias says it wins more than ${yesAvg.toFixed(0)}% of the time`,
+    };
+  }
+  
+  // Strong favorite on NO side: YES < 30c
+  if (yesAvg <= 30 && (100 - yesBid) <= 80) {
+    const noAvg = 100 - yesAvg;
+    const conf = Math.min(0.92, noAvg / 100 + 0.05);
+    return {
+      signal: "no",
+      confidence: parseFloat(conf.toFixed(2)),
+      reason: `Favorite-longshot: NO@${noAvg.toFixed(0)}c is favorite, bias says it wins more than ${noAvg.toFixed(0)}% of the time`,
+    };
+  }
+  
+  return { signal: "none", confidence: 0, reason: `No strong favorite (YES@${yesAvg.toFixed(0)}c, need >70 or <30)` };
+}
+
 function evalConsensus(
   mom1m: number,
   yesBid: number,
-  yesAsk: number
+  yesAsk: number,
+  ofi: number // NEW parameter
 ): StrategySignal {
   let bullishVotes = 0;
   let bearishVotes = 0;
 
-  // Vote 1: 1-min momentum direction
+  // Vote 1: 1-min momentum
   if (mom1m > 0.01) bullishVotes++;
   else if (mom1m < -0.01) bearishVotes++;
 
@@ -159,81 +282,145 @@ function evalConsensus(
   if (previousMarketResult === "yes") bullishVotes++;
   else if (previousMarketResult === "no") bearishVotes++;
 
-  // Vote 3: Orderbook skew
-  const yesAvg = (yesBid + yesAsk) / 2;
+  // Vote 3: Orderbook skew (Kalshi)
   if (yesBid > 52) bullishVotes++;
   else if (yesBid < 48) bearishVotes++;
 
-  const yesPrice = yesAvg;
+  // Vote 4: OFI from crypto exchange (NEW)
+  if (ofi > 0.15) bullishVotes++;
+  else if (ofi < -0.15) bearishVotes++;
+
+  const yesPrice = (yesBid + yesAsk) / 2;
+  const totalVoters = 4; // updated from 3
   
-  if (bullishVotes >= 2) {
+  if (bullishVotes >= 3) { // require 3/4 for higher conviction
     if (yesPrice >= 35 && yesPrice <= 57) {
-      const conf = Math.min(0.95, 0.55 + bullishVotes * 0.12);
+      const conf = Math.min(0.95, 0.55 + bullishVotes * 0.10);
       return {
         signal: "yes",
         confidence: parseFloat(conf.toFixed(2)),
-        reason: `${bullishVotes}/3 agree YES (mom:${mom1m > 0.01 ? "Y" : "N"} prev:${previousMarketResult || "—"} skew:${yesBid > 52 ? "Y" : "N"})`,
+        reason: `${bullishVotes}/${totalVoters} agree YES (mom:${mom1m > 0.01 ? "Y" : "N"} prev:${previousMarketResult || "\u2014"} skew:${yesBid > 52 ? "Y" : "N"} ofi:${ofi > 0.15 ? "Y" : "N"})`,
       };
     }
-    return { signal: "none", confidence: 0, reason: `${bullishVotes}/3 bull but YES@${yesPrice.toFixed(0)}c outside 35-57c range` };
+    return { signal: "none", confidence: 0, reason: `${bullishVotes}/${totalVoters} bull but YES@${yesPrice.toFixed(0)}c outside 35-57c range` };
   }
 
-  if (bearishVotes >= 2) {
+  if (bearishVotes >= 3) {
     const noPrice = 100 - yesPrice;
     if (noPrice >= 35 && noPrice <= 57) {
-      const conf = Math.min(0.95, 0.55 + bearishVotes * 0.12);
+      const conf = Math.min(0.95, 0.55 + bearishVotes * 0.10);
       return {
         signal: "no",
         confidence: parseFloat(conf.toFixed(2)),
-        reason: `${bearishVotes}/3 agree NO (mom:${mom1m < -0.01 ? "Y" : "N"} prev:${previousMarketResult || "—"} skew:${yesBid < 48 ? "Y" : "N"})`,
+        reason: `${bearishVotes}/${totalVoters} agree NO (mom:${mom1m < -0.01 ? "Y" : "N"} prev:${previousMarketResult || "\u2014"} skew:${yesBid < 48 ? "Y" : "N"} ofi:${ofi < -0.15 ? "Y" : "N"})`,
       };
     }
-    return { signal: "none", confidence: 0, reason: `${bearishVotes}/3 bear but NO@${noPrice.toFixed(0)}c outside 35-57c range` };
+    return { signal: "none", confidence: 0, reason: `${bearishVotes}/${totalVoters} bear but NO@${noPrice.toFixed(0)}c outside 35-57c range` };
   }
 
-  return { signal: "none", confidence: 0, reason: `No consensus (bull:${bullishVotes} bear:${bearishVotes})` };
+  return { signal: "none", confidence: 0, reason: `No consensus (bull:${bullishVotes} bear:${bearishVotes}/${totalVoters})` };
 }
 
-// ── Paper Trading ───────────────────────────────────────────────
-function simulateTrade(
+// ── Kelly Criterion Position Sizing ─────────────────────────────
+function kellySize(confidence: number, priceCents: number, bankroll: number = 500, fraction: number = 0.25): number {
+  // confidence = our estimated probability of winning
+  // priceCents = what we pay per contract (in cents)
+  // Kelly: f* = (b*p - q) / b where b = (100-price)/price, p = confidence, q = 1-p
+  const p = confidence;
+  const q = 1 - p;
+  const b = (100 - priceCents) / priceCents; // odds
+  const kelly = (b * p - q) / b;
+  if (kelly <= 0) return 0; // no edge, don't bet
+  const fractionalKelly = kelly * fraction; // use 25% Kelly for safety
+  const dollarBet = bankroll * fractionalKelly;
+  const contracts = Math.floor(dollarBet / (priceCents / 100));
+  return Math.max(0, Math.min(20, contracts)); // cap at 20 contracts
+}
+
+// ── Paper Trading (Real Settlement) ─────────────────────────────
+// Trades go in as "pending" and only resolve when Kalshi settles
+// the market. This mirrors real trading behavior exactly.
+
+function openPaperTrade(
   signal: StrategySignal,
-  market: NonNullable<TickData["current_market"]>
+  market: NonNullable<TickData["current_market"]>,
+  strategyName: string
 ): void {
   if (signal.signal === "none") return;
+  if (botPaused) return;
+  if (stats.daily_pnl <= DAILY_LOSS_LIMIT) {
+    botPaused = true;
+    return;
+  }
 
   const price = signal.signal === "yes" ? market.yes_ask : (100 - market.yes_bid);
   if (price <= 0 || price >= 100) return;
-  const contracts = Math.min(10, Math.floor(500 / price));
+  const contracts = kellySize(signal.confidence, price);
   if (contracts <= 0) return;
   const stake = (price * contracts) / 100;
-
-  // Simulate outcome based on signal confidence (simplified)
-  const win = Math.random() < signal.confidence * 0.85;
-  const profit = win ? ((100 - price) * contracts) / 100 : -stake;
 
   const trade: Trade = {
     time: new Date().toISOString(),
     ticker: market.ticker,
-    strategy: "consensus",
+    strategy: strategyName,
     side: signal.signal as "yes" | "no",
     price,
     contracts,
     stake: parseFloat(stake.toFixed(2)),
-    outcome: win ? "win" : "loss",
-    profit: parseFloat(profit.toFixed(2)),
+    outcome: "pending",  // stays pending until Kalshi settles the market
+    profit: 0,
   };
 
   trades.unshift(trade);
-  if (trades.length > 50) trades.pop();
-
+  if (trades.length > 100) trades.pop();
   stats.total_trades++;
-  if (win) stats.wins++;
-  else stats.losses++;
-  stats.win_rate = stats.total_trades > 0
-    ? parseFloat(((stats.wins / stats.total_trades) * 100).toFixed(1))
+  recalcStats();
+}
+
+function settlePendingTrades(settledMarkets: KalshiMarket[]): void {
+  // Build a map of ticker -> result for quick lookup
+  const resultMap = new Map<string, string>();
+  for (const m of settledMarkets) {
+    if (m.result) {
+      resultMap.set(m.ticker, m.result);
+    }
+  }
+
+  for (const trade of trades) {
+    if (trade.outcome !== "pending") continue;
+
+    const result = resultMap.get(trade.ticker);
+    if (!result) continue; // market hasn't settled yet
+
+    // Settle the trade based on the actual market result
+    if (trade.side === result) {
+      // We bet YES and result is YES, or we bet NO and result is NO → win
+      trade.outcome = "win";
+      trade.profit = parseFloat((((100 - trade.price) * trade.contracts) / 100).toFixed(2));
+    } else {
+      // Wrong side → lose the stake
+      trade.outcome = "loss";
+      trade.profit = parseFloat((-trade.stake).toFixed(2));
+    }
+  }
+
+  recalcStats();
+}
+
+function recalcStats(): void {
+  const completed = trades.filter((t) => t.outcome !== "pending");
+  stats.pending = trades.filter((t) => t.outcome === "pending").length;
+  stats.wins = completed.filter((t) => t.outcome === "win").length;
+  stats.losses = completed.filter((t) => t.outcome === "loss").length;
+  stats.total_trades = trades.length;
+  stats.win_rate = completed.length > 0
+    ? parseFloat(((stats.wins / completed.length) * 100).toFixed(1))
     : 0;
-  stats.total_pnl = parseFloat((stats.total_pnl + profit).toFixed(2));
+  stats.total_pnl = parseFloat(
+    completed.reduce((sum, t) => sum + t.profit, 0).toFixed(2)
+  );
   stats.daily_pnl = stats.total_pnl;
+  stats.bot_paused = botPaused;
 }
 
 // ── Main Tick ───────────────────────────────────────────────────
@@ -268,8 +455,8 @@ async function tick(): Promise<TickData> {
     };
   }
 
-  // Fetch settled markets
-  const settledMarkets = await fetchKalshiMarkets("settled", 5);
+  // Fetch settled markets (enough to cover any pending trades)
+  const settledMarkets = await fetchKalshiMarkets("settled", 20);
   if (settledMarkets.length > 0) {
     const s = settledMarkets[0];
     if (s.result) {
@@ -281,22 +468,39 @@ async function tick(): Promise<TickData> {
     }
   }
 
+  // Settle any pending paper trades against real Kalshi results
+  settlePendingTrades(settledMarkets);
+
   // Evaluate strategies
   const yesBid = currentMarket?.yes_bid ?? 50;
   const yesAsk = currentMarket?.yes_ask ?? 50;
 
+  const ofi = await fetchOFI();
+  const secondsRemaining = currentMarket?.seconds_remaining ?? 999;
+
   const momentum = evalMomentum(mom1m, mom5m);
   const meanReversion = evalMeanReversion(mom1m, mom5m, yesBid, yesAsk);
-  const consensus = evalConsensus(mom1m, yesBid, yesAsk);
+  const consensus = evalConsensus(mom1m, yesBid, yesAsk, ofi);
+  const resolutionRider = evalResolutionRider(secondsRemaining, yesBid, yesAsk, mom1m);
+  const favoriteBias = evalFavoriteBias(yesBid, yesAsk, secondsRemaining);
 
-  // Simulate paper trade on consensus signal
-  if (consensus.signal !== "none" && currentMarket) {
-    // Only trade once per market per signal
-    const alreadyTraded = trades.some(
-      (t) => t.ticker === currentMarket!.ticker && t.strategy === "consensus"
-    );
-    if (!alreadyTraded) {
-      simulateTrade(consensus, currentMarket);
+  // Fire trades for any strategy that signals
+  const strategyMap: Record<string, StrategySignal> = {
+    consensus,
+    resolution_rider: resolutionRider,
+    favorite_bias: favoriteBias,
+    momentum,
+    mean_reversion: meanReversion,
+  };
+
+  for (const [name, signal] of Object.entries(strategyMap)) {
+    if (signal.signal !== "none" && currentMarket) {
+      const alreadyTraded = trades.some(
+        (t) => t.ticker === currentMarket!.ticker && t.strategy === name
+      );
+      if (!alreadyTraded) {
+        openPaperTrade(signal, currentMarket, name);
+      }
     }
   }
 
@@ -312,7 +516,10 @@ async function tick(): Promise<TickData> {
       momentum,
       mean_reversion: meanReversion,
       consensus,
+      resolution_rider: resolutionRider,
+      favorite_bias: favoriteBias,
     },
+    ofi,
     trades,
     stats,
   };

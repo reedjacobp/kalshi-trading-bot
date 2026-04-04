@@ -21,6 +21,9 @@ import {
   Zap,
   Target,
   GitMerge,
+  Timer,
+  Trophy,
+  AlertTriangle,
 } from "lucide-react";
 
 // ── SSE Hook ────────────────────────────────────────────────────
@@ -244,12 +247,44 @@ function BTCChart({ prices }: { prices: [number, number][] }) {
 }
 
 // ── Current Market Panel ────────────────────────────────────────
+function OFIIndicator({ ofi }: { ofi: number }) {
+  // OFI ranges from -1 to +1
+  const pct = ((ofi + 1) / 2) * 100; // 0-100 for positioning
+  const color = ofi > 0.15 ? "text-emerald-400" : ofi < -0.15 ? "text-red-400" : "text-slate-400";
+  const barColor = ofi > 0.15 ? "bg-emerald-400" : ofi < -0.15 ? "bg-red-400" : "bg-slate-500";
+
+  return (
+    <div className="flex items-center gap-2 mt-2" data-testid="ofi-indicator">
+      <span className="text-xs text-slate-500 w-6">OFI</span>
+      <div className="flex-1 h-1.5 bg-[hsl(220,20%,12%)] rounded-full overflow-hidden relative">
+        {/* Center marker */}
+        <div className="absolute left-1/2 top-0 w-px h-full bg-slate-600 z-10" />
+        {/* Fill bar */}
+        <motion.div
+          className={`absolute top-0 h-full rounded-full ${barColor}`}
+          style={{
+            left: ofi >= 0 ? '50%' : undefined,
+            right: ofi < 0 ? '50%' : undefined,
+          }}
+          animate={{ width: `${Math.abs(ofi) * 50}%` }}
+          transition={{ duration: 0.5 }}
+        />
+      </div>
+      <span className={`text-[10px] tabular-nums w-10 text-right font-medium ${color}`}>
+        {ofi >= 0 ? "+" : ""}{ofi.toFixed(2)}
+      </span>
+    </div>
+  );
+}
+
 function CurrentMarketPanel({
   market,
   lastSettled,
+  ofi,
 }: {
   market: TickData["current_market"];
   lastSettled: TickData["last_settled"];
+  ofi: number;
 }) {
   const [countdown, setCountdown] = useState(market?.seconds_remaining ?? 0);
 
@@ -334,6 +369,9 @@ function CurrentMarketPanel({
               {Math.round(market.volume).toLocaleString()}
             </span>
           </div>
+
+          {/* OFI Indicator */}
+          <OFIIndicator ofi={ofi} />
         </>
       ) : (
         <div className="flex-1 flex items-center justify-center text-slate-500 text-sm">
@@ -375,7 +413,9 @@ function StrategySignalsPanel({
   const items = [
     { name: "Momentum", icon: Zap, ...strategies.momentum },
     { name: "Mean Reversion", icon: GitMerge, ...strategies.mean_reversion },
-    { name: "Consensus", icon: Target, ...strategies.consensus },
+    { name: "Consensus (4 signals)", icon: Target, ...strategies.consensus },
+    { name: "Resolution Rider", icon: Timer, ...strategies.resolution_rider },
+    { name: "Favorite Bias", icon: Trophy, ...strategies.favorite_bias },
   ];
 
   return (
@@ -457,7 +497,7 @@ function TradeHistoryTable({ trades }: { trades: TickData["trades"] }) {
         <span className="text-xs text-slate-400 uppercase tracking-wider font-medium">
           Trade History
         </span>
-        <span className="text-[10px] text-slate-600 ml-auto">Paper Trading</span>
+        <span className="text-[10px] text-slate-600 ml-auto">Paper Trading · Kelly 0.25x</span>
       </div>
 
       <div className="overflow-x-auto">
@@ -514,10 +554,14 @@ function TradeHistoryTable({ trades }: { trades: TickData["trades"] }) {
                   <td className="py-2 pr-3 text-right text-slate-300 tabular-nums">${trade.stake.toFixed(2)}</td>
                   <td
                     className={`py-2 pr-3 text-right tabular-nums font-medium ${
-                      trade.profit >= 0 ? "text-emerald-400" : "text-red-400"
+                      trade.outcome === "pending"
+                        ? "text-slate-500"
+                        : trade.profit >= 0 ? "text-emerald-400" : "text-red-400"
                     }`}
                   >
-                    {trade.profit >= 0 ? "+" : ""}${trade.profit.toFixed(2)}
+                    {trade.outcome === "pending"
+                      ? "—"
+                      : `${trade.profit >= 0 ? "+" : ""}$${trade.profit.toFixed(2)}`}
                   </td>
                   <td className="py-2 text-right">
                     <span
@@ -526,10 +570,10 @@ function TradeHistoryTable({ trades }: { trades: TickData["trades"] }) {
                           ? "bg-emerald-400/10 text-emerald-400"
                           : trade.outcome === "loss"
                             ? "bg-red-400/10 text-red-400"
-                            : "bg-yellow-400/10 text-yellow-400"
-                      }`}
+                            : "bg-amber-400/10 text-amber-400"
+                      } ${trade.outcome === "pending" ? "pulse-dot-text" : ""}`}
                     >
-                      {trade.outcome}
+                      {trade.outcome === "pending" ? "⏳ pending" : trade.outcome}
                     </span>
                   </td>
                 </tr>
@@ -643,6 +687,19 @@ export default function Dashboard() {
           </div>
         ) : (
           <div className="flex flex-col gap-4 max-w-[1400px] mx-auto">
+            {/* Bot Paused Banner */}
+            {data.stats.bot_paused && (
+              <div
+                className="flex items-center gap-2 px-4 py-3 rounded-lg bg-amber-400/10 border border-amber-400/20"
+                data-testid="banner-bot-paused"
+              >
+                <AlertTriangle size={16} className="text-amber-400 shrink-0" />
+                <span className="text-sm font-medium text-amber-400">
+                  BOT PAUSED &mdash; Daily loss limit ($50) reached. Resets at midnight.
+                </span>
+              </div>
+            )}
+
             {/* KPI Row */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               <KPICard
@@ -670,7 +727,7 @@ export default function Dashboard() {
                 showSign
               />
               <KPICard
-                label="Trades"
+                label={data.stats.pending > 0 ? `Trades (${data.stats.pending} pending)` : "Trades"}
                 value={data.stats.total_trades}
                 decimals={0}
                 icon={BarChart3}
@@ -694,6 +751,7 @@ export default function Dashboard() {
               <CurrentMarketPanel
                 market={data.current_market}
                 lastSettled={data.last_settled}
+                ofi={data.ofi}
               />
               <StrategySignalsPanel strategies={data.strategies} />
             </div>

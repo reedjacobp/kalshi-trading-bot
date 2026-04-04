@@ -150,6 +150,10 @@
   animation: pulse-dot 2s ease-in-out infinite;
 }
 
+.pulse-dot-text {
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
 /* Smooth number transitions */
 .tabular-nums {
   font-variant-numeric: tabular-nums lining-nums;

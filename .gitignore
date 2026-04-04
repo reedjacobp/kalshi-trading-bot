@@ -1,9 +1,9 @@
-node_modules
-dist
+node_modules/
+dist/
+data/
+*.log
+.env
 .DS_Store
-server/public
-vite.config.ts.*
-*.tar.gz
-*.db
-*.db-shm
-*.db-wal
+__pycache__/
+*.pyc
+*.pyo
