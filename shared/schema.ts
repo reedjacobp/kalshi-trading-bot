@@ -18,6 +18,8 @@ export const tradeSchema = z.object({
   stake: z.number(),
   outcome: z.enum(["win", "loss", "pending"]),
   profit: z.number(),
+  fees: z.number(),
+  profit_after_fees: z.number(),
 });
 
 export const marketDataSchema = z.object({
@@ -26,6 +28,8 @@ export const marketDataSchema = z.object({
   yes_ask: z.number(),
   seconds_remaining: z.number(),
   volume: z.number(),
+  floor_strike: z.number().nullable().optional(),
+  cap_strike: z.number().nullable().optional(),
 });
 
 export const tickDataSchema = z.object({
@@ -34,6 +38,14 @@ export const tickDataSchema = z.object({
   btc_momentum_1m: z.number(),
   btc_momentum_5m: z.number(),
   btc_prices: z.array(z.tuple([z.number(), z.number()])),
+  eth_price: z.number(),
+  eth_momentum_1m: z.number(),
+  eth_momentum_5m: z.number(),
+  eth_prices: z.array(z.tuple([z.number(), z.number()])),
+  sol_price: z.number(),
+  sol_momentum_1m: z.number(),
+  sol_momentum_5m: z.number(),
+  sol_prices: z.array(z.tuple([z.number(), z.number()])),
   current_market: marketDataSchema.nullable(),
   last_settled: z.object({
     ticker: z.string(),
@@ -46,7 +58,65 @@ export const tickDataSchema = z.object({
     resolution_rider: strategySignalSchema,
     favorite_bias: strategySignalSchema,
   }),
+  markets: z.object({
+    btc: marketDataSchema.nullable(),
+    eth: marketDataSchema.nullable(),
+    sol: marketDataSchema.nullable(),
+  }),
+  settled: z.object({
+    btc: z.object({ ticker: z.string(), result: z.enum(["yes", "no"]) }).nullable(),
+    eth: z.object({ ticker: z.string(), result: z.enum(["yes", "no"]) }).nullable(),
+    sol: z.object({ ticker: z.string(), result: z.enum(["yes", "no"]) }).nullable(),
+  }),
+  strategies_by_asset: z.object({
+    btc: z.object({
+      momentum: strategySignalSchema,
+      mean_reversion: strategySignalSchema,
+      consensus: strategySignalSchema,
+      resolution_rider: strategySignalSchema,
+      favorite_bias: strategySignalSchema,
+    }),
+    eth: z.object({
+      momentum: strategySignalSchema,
+      mean_reversion: strategySignalSchema,
+      consensus: strategySignalSchema,
+      resolution_rider: strategySignalSchema,
+      favorite_bias: strategySignalSchema,
+    }),
+    sol: z.object({
+      momentum: strategySignalSchema,
+      mean_reversion: strategySignalSchema,
+      consensus: strategySignalSchema,
+      resolution_rider: strategySignalSchema,
+      favorite_bias: strategySignalSchema,
+    }),
+  }),
+  enabled_assets: z.object({
+    btc: z.boolean(),
+    eth: z.boolean(),
+    sol: z.boolean(),
+  }),
+  trading_enabled: z.boolean(),
+  vol_regime: z.enum(["low", "medium", "high"]),
+  vol_reading: z.number(),
   ofi: z.number(),
+  exchange_data: z.object({
+    btc: z.object({
+      divergence_pct: z.number(),
+      exchange_lead: z.string().nullable(),
+      santiment: z.record(z.number()).optional(),
+    }),
+    eth: z.object({
+      divergence_pct: z.number(),
+      exchange_lead: z.string().nullable(),
+      santiment: z.record(z.number()).optional(),
+    }),
+    sol: z.object({
+      divergence_pct: z.number(),
+      exchange_lead: z.string().nullable(),
+      santiment: z.record(z.number()).optional(),
+    }),
+  }),
   trades: z.array(tradeSchema),
   stats: z.object({
     total_trades: z.number(),
@@ -55,8 +125,14 @@ export const tickDataSchema = z.object({
     losses: z.number(),
     win_rate: z.number(),
     total_pnl: z.number(),
+    total_fees: z.number(),
+    total_pnl_after_fees: z.number(),
     daily_pnl: z.number(),
+    daily_pnl_after_fees: z.number(),
     bot_paused: z.boolean(),
+    paper_balance: z.number().nullable(),
+    live_balance: z.number().nullable(),
+    is_paper: z.boolean(),
   }),
 });
 

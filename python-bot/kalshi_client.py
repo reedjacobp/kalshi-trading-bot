@@ -8,15 +8,20 @@ Supports both demo and production environments.
 import base64
 import datetime
 import json
+import logging
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
 import requests
+from requests.exceptions import ConnectionError, HTTPError, Timeout
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+
+
+logger = logging.getLogger("kalshi_bot")
 
 
 DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
@@ -69,29 +74,74 @@ class KalshiClient:
         }
 
     def _request(self, method: str, path: str, params: dict = None, data: dict = None):
-        """Make an authenticated request to the Kalshi API."""
-        url = f"{self.base_url}{path}"
-        # Build the full path for signing (includes /trade-api/v2 prefix)
+        """Make an authenticated request to the Kalshi API with retry/backoff."""
         from urllib.parse import urlparse
-        sign_path = urlparse(url).path
-        headers = self._auth_headers(method.upper(), sign_path)
 
-        resp = self.session.request(
-            method=method.upper(),
-            url=url,
-            headers=headers,
-            params=params,
-            json=data,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        last_exc = None
+        for attempt in range(3):
+            try:
+                url = f"{self.base_url}{path}"
+                sign_path = urlparse(url).path
+                # Re-sign on each attempt (timestamp must be fresh)
+                headers = self._auth_headers(method.upper(), sign_path)
+
+                resp = self.session.request(
+                    method=method.upper(),
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=data,
+                    timeout=10,
+                )
+                # Don't retry client errors (4xx) except 429
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 2 ** attempt))
+                    logger.warning(f"Rate limited (429), retrying in {retry_after}s")
+                    time.sleep(retry_after)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except (ConnectionError, Timeout) as e:
+                last_exc = e
+                wait = 2 ** attempt
+                logger.warning(f"Request failed (attempt {attempt + 1}/3): {e}, retrying in {wait}s")
+                time.sleep(wait)
+            except HTTPError as e:
+                if e.response is not None and e.response.status_code < 500:
+                    raise  # Don't retry client errors
+                last_exc = e
+                wait = 2 ** attempt
+                logger.warning(f"Server error (attempt {attempt + 1}/3): {e}, retrying in {wait}s")
+                time.sleep(wait)
+        raise last_exc
 
     def _public_get(self, path: str, params: dict = None):
-        """Make an unauthenticated GET (public market data)."""
-        url = f"{self.base_url}{path}"
-        resp = self.session.get(url, params=params)
-        resp.raise_for_status()
-        return resp.json()
+        """Make an unauthenticated GET (public market data) with retry/backoff."""
+        last_exc = None
+        for attempt in range(3):
+            try:
+                url = f"{self.base_url}{path}"
+                resp = self.session.get(url, params=params, timeout=10)
+                if resp.status_code == 429:
+                    retry_after = int(resp.headers.get("Retry-After", 2 ** attempt))
+                    logger.warning(f"Rate limited (429), retrying in {retry_after}s")
+                    time.sleep(retry_after)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except (ConnectionError, Timeout) as e:
+                last_exc = e
+                wait = 2 ** attempt
+                logger.warning(f"Public GET failed (attempt {attempt + 1}/3): {e}, retrying in {wait}s")
+                time.sleep(wait)
+            except HTTPError as e:
+                if e.response is not None and e.response.status_code < 500:
+                    raise
+                last_exc = e
+                wait = 2 ** attempt
+                logger.warning(f"Server error (attempt {attempt + 1}/3): {e}, retrying in {wait}s")
+                time.sleep(wait)
+        raise last_exc
 
     # ─── Market Data (Public) ────────────────────────────────────────────
 

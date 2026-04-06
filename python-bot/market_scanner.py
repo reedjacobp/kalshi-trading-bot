@@ -20,14 +20,15 @@ class MarketScanner:
         self.client = client
         self.series = series
         self._cache = {}
-        self._cache_ts = 0
-        self._cache_ttl = 3  # seconds
+        self._cache_ts = {}   # per-key timestamps
+        self._cache_ttl = 3  # seconds — keep fresh for fast-moving 15-min markets
 
     def _fresh_markets(self, status: str = None, limit: int = 200) -> list:
-        """Fetch markets from the API, with a short TTL cache."""
+        """Fetch markets from the API, with a per-key TTL cache."""
         cache_key = f"{status}_{limit}"
         now = time.time()
-        if cache_key in self._cache and (now - self._cache_ts) < self._cache_ttl:
+        cached_ts = self._cache_ts.get(cache_key, 0)
+        if cache_key in self._cache and (now - cached_ts) < self._cache_ttl:
             return self._cache[cache_key]
 
         result = self.client.get_markets(
@@ -35,7 +36,7 @@ class MarketScanner:
         )
         markets = result.get("markets", [])
         self._cache[cache_key] = markets
-        self._cache_ts = now
+        self._cache_ts[cache_key] = now
         return markets
 
     def get_open_markets(self) -> list:

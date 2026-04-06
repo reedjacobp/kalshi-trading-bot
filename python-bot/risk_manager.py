@@ -6,19 +6,32 @@ and per-trade risk controls. No trade gets executed without passing
 through the risk manager first.
 """
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 
+def kalshi_taker_fee(contracts: int, price_cents: int) -> float:
+    """
+    Kalshi taker fee per trade: 0.07 * contracts * P * (1 - P)
+    where P = price in dollars (price_cents / 100).
+    Total rounded up to the nearest cent.
+    """
+    p = price_cents / 100.0
+    fee = 0.07 * contracts * p * (1 - p)
+    return math.ceil(fee * 100) / 100  # round up to nearest cent
+
+
 @dataclass
 class RiskConfig:
     """Risk management configuration."""
-    stake_usd: float = 5.00           # USD per trade
+    stake_usd: float = 5.00           # Fixed stake fallback (used when no balance available)
+    kelly_fraction: float = 0.25      # Quarter-Kelly (conservative)
     max_daily_loss_usd: float = 25.00  # Stop after this daily loss
     max_weekly_loss_usd: float = 75.00 # Stop after this weekly loss
     max_concurrent_positions: int = 3   # Max open positions
-    max_position_pct: float = 0.02     # Max 2% of balance per trade
+    max_position_pct: float = 0.05     # Max 5% of balance per trade
     min_confidence: float = 0.3        # Minimum strategy confidence to trade
     cooldown_after_loss_secs: int = 60 # Wait this long after a loss before trading again
     max_trades_per_hour: int = 20      # Rate limit
@@ -39,6 +52,9 @@ class TradeRecord:
     outcome: str = ""   # "win", "loss", or "" if pending
     payout_usd: float = 0.0
     profit_usd: float = 0.0
+    entry_fee_usd: float = 0.0   # Kalshi taker fee on entry
+    settle_fee_usd: float = 0.0  # Kalshi taker fee on settlement (win payout)
+    profit_after_fees: float = 0.0  # profit_usd minus all fees
 
 
 class RiskManager:
@@ -145,24 +161,79 @@ class RiskManager:
         # Balance check (if balance known)
         if balance_usd is not None:
             max_stake = balance_usd * self.config.max_position_pct
-            if self.config.stake_usd > max_stake:
-                return False, f"Stake ${self.config.stake_usd:.2f} exceeds {self.config.max_position_pct*100:.0f}% of balance"
+            # Use the actual Kelly-sized stake, not the fixed ceiling
+            actual_contracts = self.calculate_contracts(price_cents, confidence, balance_usd)
+            actual_stake = actual_contracts * (price_cents / 100.0)
+            if actual_stake > max_stake:
+                return False, f"Stake ${actual_stake:.2f} exceeds {self.config.max_position_pct*100:.0f}% of balance (${max_stake:.2f})"
 
         return True, "Approved"
 
-    def calculate_contracts(self, price_cents: int) -> int:
+    def correlated_position_count(self) -> int:
+        """Count open positions that share the same 15-min window (correlated)."""
+        # Tickers like KXBTC15M-26APR050400-00: the window suffix is the last part
+        windows = set()
+        for ticker in self.open_positions:
+            # Extract the window identifier (e.g., "26APR050400-00")
+            parts = ticker.split("-", 1)
+            if len(parts) > 1:
+                windows.add(parts[1])
+        # Count how many open positions share a window with any other
+        if not windows:
+            return 0
+        return len(self.open_positions)
+
+    def calculate_contracts(
+        self, price_cents: int, confidence: float = 0.0, balance_usd: float = None
+    ) -> int:
         """
-        How many contracts to buy at the given price.
-        Each contract costs `price_cents` and pays $1 if correct.
+        Kelly-sized position: how many contracts to buy.
+
+        Each contract costs `price_cents` cents and pays $1 if correct.
+        Kelly fraction f* = (p*b - q) / b, where:
+          p = estimated win probability (confidence)
+          q = 1 - p
+          b = net odds = (100 - price_cents) / price_cents
+
+        We then apply kelly_fraction (0.25 = quarter-Kelly) and cap at
+        max_position_pct of balance.
         """
         if price_cents <= 0 or price_cents >= 100:
             return 0
+
         price_usd = price_cents / 100.0
-        contracts = int(self.config.stake_usd / price_usd)
-        return max(1, contracts)
+
+        # Determine stake via Kelly sizing if we have confidence + balance
+        if confidence > 0 and balance_usd is not None and balance_usd > 0:
+            p = confidence
+            q = 1 - p
+            b = (100 - price_cents) / price_cents  # net odds (payout / cost)
+            kelly_f = (p * b - q) / b if b > 0 else 0
+            kelly_f = max(0, kelly_f)  # never negative
+            kelly_f *= self.config.kelly_fraction  # fractional Kelly
+
+            stake = kelly_f * balance_usd
+            # Cap at max_position_pct of balance
+            stake = min(stake, balance_usd * self.config.max_position_pct)
+            # Also cap at the fixed stake_usd as an absolute ceiling
+            stake = min(stake, self.config.stake_usd)
+            # Correlation discount: reduce size when multiple positions open
+            # BTC/ETH/SOL are ~67% correlated, so 2+ positions = overexposed
+            open_count = self.correlated_position_count()
+            if open_count >= 2:
+                stake *= 0.6  # 40% reduction with 2+ correlated positions
+            elif open_count == 1:
+                stake *= 0.8  # 20% reduction with 1 existing position
+        else:
+            # Fallback: fixed stake
+            stake = self.config.stake_usd
+
+        contracts = int(stake / price_usd)
+        return max(1, min(contracts, 100))  # floor 1, cap 100
 
     def record_trade(self, record: TradeRecord):
         """Record a new trade and add to open positions."""
+        record.entry_fee_usd = kalshi_taker_fee(record.contracts, record.price_cents)
         self.trades.append(record)
         self.open_positions[record.ticker] = record
 
@@ -182,11 +253,15 @@ class RiskManager:
             record.outcome = "win"
             record.payout_usd = record.contracts * 1.00  # $1 per winning contract
             record.profit_usd = record.payout_usd - record.stake_usd
+            # Settlement fee on the winning payout (treated as a new "trade" at $1.00)
+            record.settle_fee_usd = kalshi_taker_fee(record.contracts, 100 - record.price_cents)
         else:
             record.outcome = "loss"
             record.payout_usd = 0.0
             record.profit_usd = -record.stake_usd
+            record.settle_fee_usd = 0.0  # No settlement fee on losses
             self._last_loss_ts = time.time()
+        record.profit_after_fees = record.profit_usd - record.entry_fee_usd - record.settle_fee_usd
 
     def stats_summary(self) -> str:
         """Human-readable summary of trading stats."""

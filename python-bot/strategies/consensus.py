@@ -32,12 +32,13 @@ class ConsensusStrategy(Strategy):
 
     Entry rules:
     - At least 2/3 signals agree on YES or NO
-    - Contract price must be in the sweet spot (35-60 cents on our side)
+    - Contract price must be in the sweet spot (35-50 cents on our side)
     - At least 3 minutes remaining in the window
     - Daily loss cap not reached
+    - Estimated edge must exceed minimum threshold
 
-    This strategy backtests at ~60-65% win rate on BTC 15-min markets,
-    which with $0.45-0.55 average entry prices yields positive expectancy.
+    Positive expectancy requires entry prices well below the win rate.
+    At 50c max entry, breakeven is 50% — a 60%+ win rate gives real edge.
     """
 
     name = "consensus"
@@ -45,16 +46,18 @@ class ConsensusStrategy(Strategy):
     def __init__(
         self,
         momentum_threshold: float = 0.03,   # Min 1m momentum for signal
-        max_entry_price: int = 57,           # Won't pay more than 57c on our side
-        min_entry_price: int = 35,           # Won't take ultra-cheap bets
+        max_entry_price: int = 55,           # Won't pay more than 55c (raised from 50 for spread crossing)
+        min_entry_price: int = 38,           # Raised from 35 — avoid deep coin-flip zone
         min_seconds_remaining: int = 180,    # Need at least 3 min left
         min_agreement: int = 2,              # Min signals that must agree (out of 3)
+        min_edge: float = 0.10,              # Raised from 5% to 10% — require more conviction
     ):
         self.momentum_threshold = momentum_threshold
         self.max_entry_price = max_entry_price
         self.min_entry_price = min_entry_price
         self.min_seconds_remaining = min_seconds_remaining
         self.min_agreement = min_agreement
+        self.min_edge = min_edge
 
     def _momentum_signal(self, price_feed) -> Optional[str]:
         """Returns 'yes' (bullish), 'no' (bearish), or None."""
@@ -81,18 +84,34 @@ class ConsensusStrategy(Strategy):
 
     def _orderbook_signal(self, market: dict, scanner) -> Optional[str]:
         """
-        Infer direction from Kalshi contract pricing.
-        If YES is bid > 52, the market leans bullish → signal YES.
-        If YES is bid < 48, the market leans bearish → signal NO.
+        Infer direction from orderbook imbalance, NOT from the mid-price.
+
+        Fetches the full orderbook and compares total YES bid depth vs
+        total NO bid depth (i.e., YES ask depth). A lopsided book
+        suggests directional pressure that isn't yet reflected in price.
         """
-        yes_bid, yes_ask = scanner.parse_yes_price(market)
-        if yes_bid is None:
+        try:
+            book = scanner.client.get_orderbook(market["ticker"], depth=10)
+        except Exception:
             return None
-        if yes_bid > 52:
+
+        yes_bids = book.get("orderbook", {}).get("yes", [])
+        no_bids = book.get("orderbook", {}).get("no", [])
+
+        # Sum up resting quantity on each side
+        yes_depth = sum(level[1] for level in yes_bids) if yes_bids else 0
+        no_depth = sum(level[1] for level in no_bids) if no_bids else 0
+
+        total = yes_depth + no_depth
+        if total < 10:
+            return None  # Too thin to read
+
+        imbalance = (yes_depth - no_depth) / total
+        if imbalance > 0.15:
             return "yes"
-        if yes_bid < 48:
+        if imbalance < -0.15:
             return "no"
-        return None  # Neutral zone
+        return None
 
     def evaluate(self, market, last_settled, price_feed, scanner) -> TradeRecommendation:
         no_trade = TradeRecommendation(
@@ -158,11 +177,25 @@ class ConsensusStrategy(Strategy):
         agreement_ratio = max(yes_votes, no_votes) / max(valid_votes, 1)
         confidence = agreement_ratio * 0.7 + (1.0 - our_price / 100.0) * 0.3
 
+        # Expected value check: at this price, does our estimated win
+        # probability clear breakeven by at least min_edge?
+        # Breakeven win rate at price P cents = P / 100
+        breakeven_wr = our_price / 100.0
+        estimated_wr = confidence  # Use confidence as our probability estimate
+        edge = estimated_wr - breakeven_wr
+
+        if edge < self.min_edge:
+            no_trade.reason = (
+                f"Insufficient edge: est_WR={estimated_wr:.0%} vs "
+                f"breakeven={breakeven_wr:.0%} (edge={edge:.0%}, need {self.min_edge:.0%}): {signal_summary}"
+            )
+            return no_trade
+
         signal = Signal.BUY_YES if direction == "yes" else Signal.BUY_NO
         return TradeRecommendation(
             signal=signal,
             confidence=confidence,
             strategy_name=self.name,
             reason=f"Consensus {direction.upper()} ({max(yes_votes, no_votes)}/{valid_votes}): {signal_summary}",
-            max_price_cents=min(our_price + 2, self.max_entry_price),
+            max_price_cents=our_price,
         )
