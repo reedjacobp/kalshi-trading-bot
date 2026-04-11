@@ -909,10 +909,11 @@ class TradingBot:
         if rr_params_path.exists():
             with open(rr_params_path) as f:
                 all_rr_params = json.load(f)
-            # Only enable cells with 100% cross-validated win rate
+            # Enable cells that were profitable in cross-validation
+            # (or have no CV data but profitable training)
             safe_cells = {k: v for k, v in all_rr_params.items()
-                          if v.get("cv_mean_win_rate") == 1.0 or
-                          (v.get("cv_folds", 0) == 0 and v.get("training_win_rate", 0) == 1.0)}
+                          if v.get("cv_val_profit", 0) > 0 or
+                          (v.get("cv_folds", 0) == 0 and v.get("training_profit", 0) > 0)}
             self._rr_cell_params = safe_cells
             self._log(f"[INIT] Loaded optimized RR params: {len(safe_cells)} safe cells "
                       f"({', '.join(sorted(safe_cells.keys()))})")
@@ -2362,7 +2363,7 @@ class TradingBot:
 
     def _check_settlements_for(self, scanner):
         """Check if any open positions have settled (in-memory + CSV)."""
-        settled_markets = scanner.get_settled_markets(limit=20)
+        settled_markets = scanner.get_settled_markets(limit=50)
         settled_by_ticker = {m["ticker"]: m.get("result") for m in settled_markets if m.get("result")}
 
         # For positions not found in the bulk query (common with daily markets
@@ -2421,6 +2422,8 @@ class TradingBot:
             return
         self._csv_settle_checks[scanner.series] = now
         unsettled = self.logger.get_unsettled_trades()
+        lookups_this_cycle = 0
+        max_lookups_per_cycle = 3  # Cap individual API calls to avoid rate-limiting
         for trade_row in unsettled:
             ticker = trade_row["ticker"]
 
@@ -2432,6 +2435,9 @@ class TradingBot:
 
             # Direct API fallback (matches in-memory position handling)
             if not result:
+                if lookups_this_cycle >= max_lookups_per_cycle:
+                    continue  # Skip — will retry next cycle
+                lookups_this_cycle += 1
                 try:
                     market_data = scanner.client.get_market(ticker)
                     m = market_data.get("market", market_data)

@@ -41,7 +41,7 @@ PARAM_RANGES = {
     "momentum_periods": (1, 10),
 }
 
-ALPHA = 0.8  # Win rate weight in scoring
+ALPHA = 0.3  # Win rate weight in blended score (training phase only)
 
 
 def sample_params() -> dict:
@@ -493,8 +493,13 @@ def main():
     all_tick_windows = load_tick_windows(tick_dir) if Path(tick_dir).exists() else []
     print(f"  Ticks: {len(all_tick_windows)} market windows")
 
-    crypto_prices = load_crypto_prices(
-        "/home/jake/workspaces/kalshi-trading-bot/python-bot/data/prices")
+    # Use local data/prices if available, fall back to other paths
+    price_candidates = [
+        "data/prices",
+        "/home/jake/workspaces/kalshi-trading-bot/python-bot/data/prices",
+    ]
+    price_dir = next((p for p in price_candidates if Path(p).exists()), "data/prices")
+    crypto_prices = load_crypto_prices(price_dir)
     for coin, p in crypto_prices.items():
         print(f"  {coin.upper()}: {len(p)} price points")
 
@@ -609,9 +614,10 @@ def main():
             train_total = sum(f["train"]["trades"] for f in fold_results)
             train_wr = train_wr / train_total if train_total > 0 else 0
 
-            # Score: prioritize val win rate, then trade count
-            norm_profit = max(0, min(1, (total_val_wins * 0.3) / max(1, total_val_trades)))
-            score = ALPHA * val_wr + (1 - ALPHA) * norm_profit
+            # Score: total profit across all validation folds
+            # This naturally rewards both high WR AND high volume
+            total_val_profit = sum(f["val"]["profit"] for f in fold_results)
+            score = total_val_profit
 
             candidate_scores.append((
                 score, val_wr, total_val_losses, total_val_trades,
@@ -622,8 +628,8 @@ def main():
             print(f"  {cell}: no candidates with validation trades")
             continue
 
-        # Sort: zero val losses first, then by score, then by trade count
-        candidate_scores.sort(key=lambda x: (x[2] > 0, -x[0], -x[3]))
+        # Sort: by total validation profit (highest first), then trade count
+        candidate_scores.sort(key=lambda x: (-x[0], -x[3]))
 
         best = candidate_scores[0]
         score, val_wr, val_losses, val_trades, train_wr, train_trades, p, folds = best

@@ -16,6 +16,8 @@ from kalshi_client import KalshiClient
 class MarketScanner:
     """Finds and tracks 15-minute crypto markets on Kalshi."""
 
+    _scanner_count = 0  # Class-level counter for staggering cache expiry
+
     def __init__(self, client: KalshiClient, series: str = "KXBTC15M",
                  ws_feed=None):
         self.client = client
@@ -24,12 +26,22 @@ class MarketScanner:
         self._cache = {}
         self._cache_ts = {}   # per-key timestamps
         self._cache_ttl = 60  # seconds — fast RR uses WS, REST is just for discovery/settlement
+        # Stagger initial cache timestamps so scanners don't all expire at once
+        MarketScanner._scanner_count += 1
+        self._cache_offset = MarketScanner._scanner_count * 4  # 4s apart
 
     def _fresh_markets(self, status: str = None, limit: int = 200) -> list:
-        """Fetch markets from the API, with a per-key TTL cache."""
+        """Fetch markets from the API, with a per-key TTL cache.
+        Cache expiry is staggered across scanner instances to avoid
+        bursting 14 scanners' worth of REST calls simultaneously."""
         cache_key = f"{status}_{limit}"
         now = time.time()
         cached_ts = self._cache_ts.get(cache_key, 0)
+        # First call: pretend cache was set _offset seconds ago so each
+        # scanner's cache expires at a different time
+        if cached_ts == 0:
+            cached_ts = now - self._cache_offset
+            self._cache_ts[cache_key] = cached_ts
         if cache_key in self._cache and (now - cached_ts) < self._cache_ttl:
             return self._cache[cache_key]
 
@@ -157,7 +169,9 @@ class MarketScanner:
 
     def get_last_settled_market(self) -> Optional[dict]:
         """Get the most recently settled market and its result."""
-        settled = self.get_settled_markets(limit=10)
+        # Use limit=50 to share cache with _check_settlements_for() and
+        # avoid a separate REST call for the same data
+        settled = self.get_settled_markets(limit=50)
         if not settled:
             return None
         return settled[0]

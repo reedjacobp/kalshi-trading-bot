@@ -9,6 +9,7 @@ import base64
 import datetime
 import json
 import logging
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -31,6 +32,11 @@ PROD_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 class KalshiClient:
     """Authenticated client for the Kalshi Trading API v2."""
 
+    # Rate limiter shared across all instances (Kalshi rate-limits per API key)
+    _rate_lock = threading.Lock()
+    _request_times: list[float] = []
+    _max_requests_per_second = 8  # Stay under Kalshi's limit with headroom for orders
+
     def __init__(self, key_id: str, private_key_path: str, env: str = "demo"):
         self.key_id = key_id
         self.base_url = DEMO_BASE_URL if env == "demo" else PROD_BASE_URL
@@ -47,6 +53,22 @@ class KalshiClient:
             self.private_key = serialization.load_pem_private_key(
                 f.read(), password=None, backend=default_backend()
             )
+
+    def _wait_for_rate_limit(self):
+        """Block until we're under the per-second request cap."""
+        with self._rate_lock:
+            now = time.monotonic()
+            # Prune timestamps older than 1 second
+            self._request_times = [t for t in self._request_times if now - t < 1.0]
+            if len(self._request_times) >= self._max_requests_per_second:
+                sleep_until = self._request_times[0] + 1.0
+                wait = sleep_until - now
+                if wait > 0:
+                    time.sleep(wait)
+                # Prune again after sleeping
+                now = time.monotonic()
+                self._request_times = [t for t in self._request_times if now - t < 1.0]
+            self._request_times.append(time.monotonic())
 
     def _sign(self, timestamp_ms: str, method: str, path: str) -> str:
         """Create RSA-PSS signature for request authentication."""
@@ -79,6 +101,7 @@ class KalshiClient:
 
         last_exc = None
         for attempt in range(3):
+            self._wait_for_rate_limit()
             try:
                 url = f"{self.base_url}{path}"
                 sign_path = urlparse(url).path
@@ -119,6 +142,7 @@ class KalshiClient:
         """Make an unauthenticated GET (public market data) with retry/backoff."""
         last_exc = None
         for attempt in range(3):
+            self._wait_for_rate_limit()
             try:
                 url = f"{self.base_url}{path}"
                 resp = self.session.get(url, params=params, timeout=10)
