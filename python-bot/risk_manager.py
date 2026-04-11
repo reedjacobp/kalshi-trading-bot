@@ -23,6 +23,14 @@ def kalshi_taker_fee(contracts: int, price_cents: int) -> float:
     return math.ceil(fee * 100) / 100  # round up to nearest cent
 
 
+def kalshi_maker_fee(contracts: int, price_cents: int) -> float:
+    """
+    Kalshi maker fee: $0.00 (zero fees for resting limit orders).
+    Confirmed via Kalshi portfolio page — all maker fills show $0.00 fees.
+    """
+    return 0.0
+
+
 @dataclass
 class RiskConfig:
     """Risk management configuration."""
@@ -52,9 +60,10 @@ class TradeRecord:
     outcome: str = ""   # "win", "loss", or "" if pending
     payout_usd: float = 0.0
     profit_usd: float = 0.0
-    entry_fee_usd: float = 0.0   # Kalshi taker fee on entry
+    entry_fee_usd: float = 0.0   # Kalshi fee on entry (maker or taker)
     settle_fee_usd: float = 0.0  # Kalshi taker fee on settlement (win payout)
     profit_after_fees: float = 0.0  # profit_usd minus all fees
+    is_maker: bool = False  # True if entry was a passive maker order
 
 
 class RiskManager:
@@ -184,19 +193,25 @@ class RiskManager:
         return len(self.open_positions)
 
     def calculate_contracts(
-        self, price_cents: int, confidence: float = 0.0, balance_usd: float = None
+        self, price_cents: int, confidence: float = 0.0, balance_usd: float = None,
+        calibrated_probability: float = None,
     ) -> int:
         """
         Kelly-sized position: how many contracts to buy.
 
         Each contract costs `price_cents` cents and pays $1 if correct.
         Kelly fraction f* = (p*b - q) / b, where:
-          p = estimated win probability (confidence)
+          p = estimated win probability (calibrated_probability or confidence)
           q = 1 - p
           b = net odds = (100 - price_cents) / price_cents
 
         We then apply kelly_fraction (0.25 = quarter-Kelly) and cap at
         max_position_pct of balance.
+
+        Args:
+            calibrated_probability: If provided, use this as the win
+                probability instead of raw confidence. This should be
+                the output of ConfidenceCalibrator.calibrate().
         """
         if price_cents <= 0 or price_cents >= 100:
             return 0
@@ -205,7 +220,8 @@ class RiskManager:
 
         # Determine stake via Kelly sizing if we have confidence + balance
         if confidence > 0 and balance_usd is not None and balance_usd > 0:
-            p = confidence
+            # Use calibrated probability for Kelly if available, else raw confidence
+            p = calibrated_probability if calibrated_probability is not None else confidence
             q = 1 - p
             b = (100 - price_cents) / price_cents  # net odds (payout / cost)
             kelly_f = (p * b - q) / b if b > 0 else 0
@@ -233,7 +249,8 @@ class RiskManager:
 
     def record_trade(self, record: TradeRecord):
         """Record a new trade and add to open positions."""
-        record.entry_fee_usd = kalshi_taker_fee(record.contracts, record.price_cents)
+        fee_fn = kalshi_maker_fee if record.is_maker else kalshi_taker_fee
+        record.entry_fee_usd = fee_fn(record.contracts, record.price_cents)
         self.trades.append(record)
         self.open_positions[record.ticker] = record
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   AreaChart,
@@ -170,6 +170,74 @@ function KPICard({
           decimals={decimals}
           showSign={showSign}
         />
+      </div>
+    </motion.div>
+  );
+}
+
+function PnLCard({
+  stats,
+  icon: Icon,
+}: {
+  stats: TickData["stats"];
+  icon: React.ElementType;
+}) {
+  const [period, setPeriod] = React.useState<"daily" | "weekly" | "monthly" | "alltime">("daily");
+
+  const periods = {
+    daily: { gross: stats.daily_pnl, net: stats.daily_pnl_after_fees, fees: stats.daily_fees ?? 0 },
+    weekly: { gross: stats.weekly_pnl ?? 0, net: stats.weekly_pnl_net ?? 0, fees: stats.weekly_fees ?? 0 },
+    monthly: { gross: stats.monthly_pnl ?? 0, net: stats.monthly_pnl_net ?? 0, fees: stats.monthly_fees ?? 0 },
+    alltime: { gross: stats.alltime_pnl ?? stats.total_pnl, net: stats.alltime_pnl_net ?? stats.total_pnl_after_fees, fees: stats.alltime_fees ?? stats.total_fees },
+  };
+
+  const p = periods[period];
+  const trend = p.net > 0 ? "text-emerald-400" : p.net < 0 ? "text-red-400" : "text-slate-400";
+
+  return (
+    <motion.div
+      className="bg-[hsl(222,33%,7%)] border border-[hsl(220,20%,12%)] rounded-lg p-4 flex flex-col gap-1 col-span-2"
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3 }}
+    >
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-slate-400 uppercase tracking-wider font-medium">
+          P&L
+        </span>
+        <div className="flex items-center gap-2">
+          <select
+            value={period}
+            onChange={(e) => setPeriod(e.target.value as typeof period)}
+            className="text-[10px] bg-[hsl(222,33%,10%)] border border-[hsl(220,20%,15%)] text-slate-400 rounded px-2 py-0.5 cursor-pointer"
+          >
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+            <option value="monthly">Monthly</option>
+            <option value="alltime">All-Time</option>
+          </select>
+          <Icon size={14} className="text-slate-500" />
+        </div>
+      </div>
+      <div className="flex items-baseline gap-3">
+        <div className="flex flex-col">
+          <span className={`text-xl font-semibold ${trend} tabular-nums`}>
+            {p.gross >= 0 ? "+" : ""}${p.gross.toFixed(2)}
+          </span>
+          <span className="text-[9px] text-slate-600 uppercase">Gross</span>
+        </div>
+        <div className="flex flex-col">
+          <span className={`text-xl font-semibold ${trend} tabular-nums`}>
+            {p.net >= 0 ? "+" : ""}${p.net.toFixed(2)}
+          </span>
+          <span className="text-[9px] text-slate-600 uppercase">Net</span>
+        </div>
+        <div className="flex flex-col">
+          <span className="text-xl font-semibold text-slate-500 tabular-nums">
+            ${p.fees.toFixed(2)}
+          </span>
+          <span className="text-[9px] text-slate-600 uppercase">Fees</span>
+        </div>
       </div>
     </motion.div>
   );
@@ -679,8 +747,202 @@ function StrategySignalsPanel({ data }: { data: TickData }) {
   );
 }
 
+// ── Resolution Rider Config ────────────────────────────────────
+function RRConfigPanel({ config }: { config: NonNullable<TickData["rr_config"]> }) {
+  const d = config.defaults;
+  const cells = Object.entries(config.per_cell).sort(([a], [b]) => a.localeCompare(b));
+
+  return (
+    <div className="bg-[hsl(222,33%,7%)] rounded-lg p-4 border border-[hsl(220,20%,12%)]">
+      <h2 className="text-sm font-semibold text-slate-300 mb-3 uppercase tracking-wider">
+        Resolution Rider Config
+        <span className="text-slate-600 font-normal ml-2">
+          (defaults: {d.min_contract_price}–{d.max_entry_price}c, {d.min_seconds}–{d.max_seconds}s, ${d.max_stake_usd} max)
+        </span>
+      </h2>
+      {cells.length > 0 && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-slate-500 uppercase tracking-wider border-b border-[hsl(220,20%,12%)]">
+                <th className="text-left py-1.5 pr-3 font-medium">Cell</th>
+                <th className="text-center py-1.5 px-2 font-medium">Price</th>
+                <th className="text-center py-1.5 px-2 font-medium">Max Secs</th>
+                <th className="text-center py-1.5 px-2 font-medium">Buffer</th>
+                <th className="text-center py-1.5 px-2 font-medium">CV WR</th>
+                <th className="text-center py-1.5 px-2 font-medium">CV Trades</th>
+              </tr>
+            </thead>
+            <tbody>
+              {cells.map(([name, cell]) => (
+                <tr key={name} className="border-b border-[hsl(220,20%,8%)]">
+                  <td className="py-1.5 pr-3 text-slate-300 font-mono text-[11px]">{name}</td>
+                  <td className="text-center py-1.5 px-2 text-slate-200">{cell.price}</td>
+                  <td className="text-center py-1.5 px-2 text-slate-200">{cell.max_secs}s</td>
+                  <td className="text-center py-1.5 px-2 text-slate-200">{cell.buffer}</td>
+                  <td className="text-center py-1.5 px-2">
+                    <span className={cell.cv_wr === 1 ? "text-emerald-400" : "text-amber-400"}>
+                      {cell.cv_wr !== null ? `${(cell.cv_wr * 100).toFixed(0)}%` : "—"}
+                    </span>
+                  </td>
+                  <td className="text-center py-1.5 px-2 text-slate-400">{cell.cv_trades}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Strategy Matrix ────────────────────────────────────────────
+function StrategyMatrixPanel({ matrix }: { matrix: NonNullable<TickData["strategy_matrix"]> }) {
+  // Build grid: rows = assets, columns = strategies
+  const assets = Array.from(new Set(matrix.map((c) => c.asset))).sort();
+  const strategies = Array.from(new Set(matrix.map((c) => c.strategy))).sort();
+  const cellMap = new Map(matrix.map((c) => [`${c.asset}|${c.strategy}`, c]));
+
+  return (
+    <div className="bg-[hsl(222,33%,7%)] rounded-lg p-4 border border-[hsl(220,20%,12%)]">
+      <h2 className="text-sm font-semibold text-slate-300 mb-3 uppercase tracking-wider">
+        Strategy Matrix
+        <span className="text-slate-600 font-normal ml-2">
+          (auto-adapts: disables at &lt;-5% edge, re-enables at &gt;+2% shadow edge)
+        </span>
+      </h2>
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-slate-500 uppercase tracking-wider border-b border-[hsl(220,20%,12%)]">
+              <th className="text-left py-2 pr-3 font-medium">Asset</th>
+              {strategies.map((s) => (
+                <th key={s} className="text-center py-2 px-2 font-medium">{s.replace("_", " ")}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {assets.map((asset, i) => (
+              <tr
+                key={asset}
+                className={`border-b border-[hsl(220,20%,8%)] ${
+                  i % 2 === 0 ? "bg-transparent" : "bg-[hsl(222,33%,6%)]"
+                }`}
+              >
+                <td className="py-2 pr-3 text-slate-300 font-mono text-[11px]">{asset}</td>
+                {strategies.map((strat) => {
+                  const cell = cellMap.get(`${asset}|${strat}`);
+                  if (!cell) {
+                    return <td key={strat} className="text-center py-2 px-2 text-slate-700">--</td>;
+                  }
+                  const edgeVal = cell.edge;
+                  const isOn = cell.enabled;
+                  const bgColor = !isOn
+                    ? "bg-red-500/5"
+                    : edgeVal !== null && edgeVal > 0
+                      ? "bg-emerald-500/5"
+                      : edgeVal !== null && edgeVal < -3
+                        ? "bg-amber-500/5"
+                        : "";
+
+                  return (
+                    <td key={strat} className={`text-center py-1.5 px-1 ${bgColor}`}>
+                      <div className="flex flex-col items-center gap-0.5">
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[9px] uppercase font-bold tracking-wider ${
+                            isOn
+                              ? "bg-emerald-400/10 text-emerald-400"
+                              : cell.status === "shadow"
+                                ? "bg-blue-400/10 text-blue-400"
+                                : "bg-red-400/10 text-red-400"
+                          }`}
+                        >
+                          {isOn ? "ON" : cell.status === "shadow" ? "SHADOW" : "OFF"}
+                        </span>
+                        <span className={`text-[10px] tabular-nums font-medium ${
+                          edgeVal === null ? "text-slate-600"
+                            : edgeVal >= 0 ? "text-emerald-400" : "text-red-400"
+                        }`}>
+                          {edgeVal !== null ? `${edgeVal >= 0 ? "+" : ""}${edgeVal.toFixed(1)}%` : "n/a"}
+                        </span>
+                        <span className="text-[9px] text-slate-600">
+                          {cell.trades}t | ${cell.recent_pnl >= 0 ? "+" : ""}{cell.recent_pnl.toFixed(0)}
+                        </span>
+                        {!isOn && cell.shadow_edge !== null && (
+                          <span className="text-[9px] text-blue-400">
+                            shadow: {cell.shadow_edge >= 0 ? "+" : ""}{cell.shadow_edge.toFixed(1)}%
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ── Trade History Pagination Footer (inside TradeHistoryTable above)
+// Already rendered inline.
+
 // ── Trade History Table ─────────────────────────────────────────
-function TradeHistoryTable({ trades, isPaper }: { trades: TickData["trades"]; isPaper: boolean }) {
+function TradeHistoryTable({ trades: rawTrades, isPaper }: { trades: TickData["trades"]; isPaper: boolean }) {
+  const [sortCol, setSortCol] = React.useState<string | null>(null);
+  const [sortDir, setSortDir] = React.useState<"asc" | "desc">("desc");
+  const [pageSize, setPageSize] = React.useState<number>(25);
+  const PAGE_OPTIONS = [10, 25, 50, 100, 0]; // 0 = all
+
+  const handleSort = (col: string) => {
+    if (sortCol === col) {
+      setSortDir(sortDir === "asc" ? "desc" : "asc");
+    } else {
+      setSortCol(col);
+      setSortDir("desc");
+    }
+  };
+
+  const trades = React.useMemo(() => {
+    if (!sortCol) return rawTrades;
+    const sorted = [...rawTrades].sort((a, b) => {
+      let va: string | number = "";
+      let vb: string | number = "";
+      switch (sortCol) {
+        case "time": va = a.time; vb = b.time; break;
+        case "ticker": va = a.ticker; vb = b.ticker; break;
+        case "strategy": va = a.strategy; vb = b.strategy; break;
+        case "side": va = a.side; vb = b.side; break;
+        case "type": va = a.order_type ?? ""; vb = b.order_type ?? ""; break;
+        case "price": va = a.price; vb = b.price; break;
+        case "contracts": va = a.contracts; vb = b.contracts; break;
+        case "stake": va = a.stake; vb = b.stake; break;
+        case "profit": va = a.profit; vb = b.profit; break;
+        case "fees": va = a.fees; vb = b.fees; break;
+        case "net": va = a.profit_after_fees; vb = b.profit_after_fees; break;
+        case "status": va = a.outcome; vb = b.outcome; break;
+      }
+      if (va < vb) return sortDir === "asc" ? -1 : 1;
+      if (va > vb) return sortDir === "asc" ? 1 : -1;
+      return 0;
+    });
+    return sorted;
+  }, [rawTrades, sortCol, sortDir]);
+
+  const displayTrades = pageSize === 0 ? trades : trades.slice(0, pageSize);
+
+  const SortHeader = ({ col, children, align }: { col: string; children: React.ReactNode; align?: string }) => (
+    <th
+      className={`${align === "right" ? "text-right" : "text-left"} py-2 pr-3 font-medium cursor-pointer hover:text-slate-300 select-none`}
+      onClick={() => handleSort(col)}
+    >
+      {children}
+      {sortCol === col ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
+    </th>
+  );
   return (
     <div className="bg-[hsl(222,33%,7%)] border border-[hsl(220,20%,12%)] rounded-lg p-4">
       <div className="flex items-center gap-2 mb-3">
@@ -688,7 +950,16 @@ function TradeHistoryTable({ trades, isPaper }: { trades: TickData["trades"]; is
         <span className="text-xs text-slate-400 uppercase tracking-wider font-medium">
           Trade History
         </span>
-        <span className={`text-[10px] ml-auto ${isPaper ? "text-slate-600" : "text-amber-500"}`}>
+        <select
+          value={pageSize}
+          onChange={(e) => setPageSize(Number(e.target.value))}
+          className="ml-auto text-[10px] bg-[hsl(222,33%,10%)] border border-[hsl(220,20%,15%)] text-slate-400 rounded px-2 py-0.5 cursor-pointer"
+        >
+          {PAGE_OPTIONS.map((n) => (
+            <option key={n} value={n}>{n === 0 ? "All" : `${n} trades`}</option>
+          ))}
+        </select>
+        <span className={`text-[10px] ${isPaper ? "text-slate-600" : "text-amber-500"}`}>
           {isPaper ? "Paper Trading" : "LIVE Trading"} · Kelly 0.25x
         </span>
       </div>
@@ -697,28 +968,29 @@ function TradeHistoryTable({ trades, isPaper }: { trades: TickData["trades"]; is
         <table className="w-full text-xs" data-testid="table-trades">
           <thead>
             <tr className="text-slate-500 uppercase tracking-wider border-b border-[hsl(220,20%,12%)]">
-              <th className="text-left py-2 pr-3 font-medium">Time</th>
-              <th className="text-left py-2 pr-3 font-medium">Ticker</th>
-              <th className="text-left py-2 pr-3 font-medium">Strategy</th>
-              <th className="text-left py-2 pr-3 font-medium">Side</th>
-              <th className="text-right py-2 pr-3 font-medium">Price</th>
-              <th className="text-right py-2 pr-3 font-medium">Contracts</th>
-              <th className="text-right py-2 pr-3 font-medium">Stake</th>
-              <th className="text-right py-2 pr-3 font-medium">Gross P&L</th>
-              <th className="text-right py-2 pr-3 font-medium">Fees</th>
-              <th className="text-right py-2 pr-3 font-medium">Net P&L</th>
-              <th className="text-right py-2 font-medium">Status</th>
+              <SortHeader col="time">Time</SortHeader>
+              <SortHeader col="ticker">Ticker</SortHeader>
+              <SortHeader col="strategy">Strategy</SortHeader>
+              <SortHeader col="side">Side</SortHeader>
+              <SortHeader col="type">Type</SortHeader>
+              <SortHeader col="price" align="right">Price</SortHeader>
+              <SortHeader col="contracts" align="right">Contracts</SortHeader>
+              <SortHeader col="stake" align="right">Stake</SortHeader>
+              <SortHeader col="profit" align="right">Gross P&L</SortHeader>
+              <SortHeader col="fees" align="right">Fees</SortHeader>
+              <SortHeader col="net" align="right">Net P&L</SortHeader>
+              <SortHeader col="status" align="right">Status</SortHeader>
             </tr>
           </thead>
           <tbody>
-            {trades.length === 0 ? (
+            {displayTrades.length === 0 ? (
               <tr>
-                <td colSpan={11} className="text-center py-8 text-slate-600">
-                  No trades yet — waiting for signals
+                <td colSpan={12} className="text-center py-8 text-slate-600">
+                  {trades.length === 0 ? "No trades yet — waiting for signals" : "No trades match"}
                 </td>
               </tr>
             ) : (
-              trades.map((trade, i) => (
+              displayTrades.map((trade, i) => (
                 <tr
                   key={`${trade.time}-${i}`}
                   className={`border-b border-[hsl(220,20%,8%)] ${
@@ -726,11 +998,14 @@ function TradeHistoryTable({ trades, isPaper }: { trades: TickData["trades"]; is
                   }`}
                   data-testid={`row-trade-${i}`}
                 >
-                  <td className="py-2 pr-3 text-slate-400 font-mono tabular-nums">
+                  <td className="py-2 pr-3 text-slate-400 font-mono tabular-nums text-[10px]">
+                    {new Date(trade.time).toLocaleDateString([], {
+                      month: "short",
+                      day: "numeric",
+                    })}{" "}
                     {new Date(trade.time).toLocaleTimeString([], {
                       hour: "2-digit",
                       minute: "2-digit",
-                      second: "2-digit",
                     })}
                   </td>
                   <td className="py-2 pr-3 text-slate-500 font-mono text-[10px] truncate max-w-[140px]">{trade.ticker}</td>
@@ -744,6 +1019,17 @@ function TradeHistoryTable({ trades, isPaper }: { trades: TickData["trades"]; is
                       }`}
                     >
                       {trade.side}
+                    </span>
+                  </td>
+                  <td className="py-2 pr-3">
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-semibold tracking-wider ${
+                        trade.order_type === "maker"
+                          ? "bg-blue-400/10 text-blue-400"
+                          : "bg-amber-400/10 text-amber-400"
+                      }`}
+                    >
+                      {trade.order_type ?? "—"}
                     </span>
                   </td>
                   <td className="py-2 pr-3 text-right text-slate-300 tabular-nums">{trade.price}¢</td>
@@ -793,6 +1079,12 @@ function TradeHistoryTable({ trades, isPaper }: { trades: TickData["trades"]; is
           </tbody>
         </table>
       </div>
+      {trades.length > 0 && (
+        <div className="text-[10px] text-slate-600 mt-2 text-right">
+          Showing {displayTrades.length} of {trades.length} trades
+          {sortCol && ` · sorted by ${sortCol}`}
+        </div>
+      )}
     </div>
   );
 }
@@ -934,7 +1226,17 @@ export default function Dashboard() {
             )}
 
             {/* KPI Row */}
-            <div className={`grid grid-cols-2 ${data.stats.is_paper ? "md:grid-cols-6" : "md:grid-cols-7"} gap-3`}>
+            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
+              {data.stats.live_balance != null && (
+                <KPICard
+                  label="Balance"
+                  value={data.stats.live_balance}
+                  prefix="$"
+                  decimals={2}
+                  icon={DollarSign}
+                  trend="neutral"
+                />
+              )}
               {data.stats.paper_balance != null && (
                 <KPICard
                   label="Paper Balance"
@@ -945,16 +1247,10 @@ export default function Dashboard() {
                   trend={data.stats.paper_balance > 100 ? "up" : data.stats.paper_balance < 100 ? "down" : "neutral"}
                 />
               )}
-              {data.stats.live_balance != null && (
-                <KPICard
-                  label="Kalshi Balance"
-                  value={data.stats.live_balance}
-                  prefix="$"
-                  decimals={2}
-                  icon={DollarSign}
-                  trend="neutral"
-                />
-              )}
+              <PnLCard
+                stats={data.stats}
+                icon={TrendingUp}
+              />
               <KPICard
                 label="Win Rate"
                 value={data.stats.win_rate}
@@ -972,31 +1268,7 @@ export default function Dashboard() {
                 }
               />
               <KPICard
-                label="Gross P&L"
-                value={data.stats.total_pnl}
-                prefix="$"
-                icon={TrendingUp}
-                trend={data.stats.total_pnl === 0 ? "neutral" : data.stats.total_pnl > 0 ? "up" : "down"}
-                showSign
-              />
-              <KPICard
-                label="Net P&L (after fees)"
-                value={data.stats.total_pnl_after_fees}
-                prefix="$"
-                icon={TrendingDown}
-                trend={data.stats.total_pnl_after_fees === 0 ? "neutral" : data.stats.total_pnl_after_fees > 0 ? "up" : "down"}
-                showSign
-              />
-              <KPICard
-                label="Total Fees"
-                value={data.stats.total_fees}
-                prefix="$"
-                decimals={2}
-                icon={BarChart3}
-                trend="neutral"
-              />
-              <KPICard
-                label={data.stats.pending > 0 ? `Trades (${data.stats.pending} pending)` : "Trades"}
+                label={data.stats.pending > 0 ? `Trades (${data.stats.pending} open)` : "Trades"}
                 value={data.stats.total_trades}
                 decimals={0}
                 icon={Activity}
@@ -1012,6 +1284,14 @@ export default function Dashboard() {
               <CurrentMarketPanel data={data} />
               <StrategySignalsPanel data={data} />
             </div>
+
+            {/* Resolution Rider Config */}
+            {data.rr_config && <RRConfigPanel config={data.rr_config} />}
+
+            {/* Strategy Matrix */}
+            {data.strategy_matrix && data.strategy_matrix.length > 0 && (
+              <StrategyMatrixPanel matrix={data.strategy_matrix} />
+            )}
 
             {/* Trade History */}
             <TradeHistoryTable trades={data.trades} isPaper={data.stats.is_paper} />

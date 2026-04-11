@@ -46,6 +46,7 @@ class RegimeParams:
     momentum_threshold: float   # min_momentum_pct override
 
     # Consensus
+    consensus_enabled: bool
     consensus_min_edge: float   # min_edge override
 
     # Early exit
@@ -127,7 +128,8 @@ class VolRegimeDetector:
                 # Low vol: momentum doesn't work (no moves)
                 momentum_enabled=False,
                 momentum_threshold=0.05,
-                # Consensus: standard edge
+                # Consensus: works well in quiet markets
+                consensus_enabled=True,
                 consensus_min_edge=0.10,
                 # Tighter stops (less noise to dodge)
                 stop_loss_cents=10,
@@ -148,7 +150,8 @@ class VolRegimeDetector:
                 # High vol: momentum works well (trends persist)
                 momentum_enabled=True,
                 momentum_threshold=0.03,  # Lower threshold — moves are real
-                # Consensus: require more edge (wider spreads in vol)
+                # High vol: consensus edge evaporates (84% WR in low activity → 61% in high)
+                consensus_enabled=False,
                 consensus_min_edge=0.12,
                 # Wider stops (avoid noise-triggered exits)
                 stop_loss_cents=22,
@@ -167,6 +170,7 @@ class VolRegimeDetector:
                 fav_max_entry=80,
                 momentum_enabled=True,
                 momentum_threshold=0.05,
+                consensus_enabled=True,
                 consensus_min_edge=0.10,
                 stop_loss_cents=15,
                 trailing_distance=5,

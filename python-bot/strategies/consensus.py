@@ -47,7 +47,7 @@ class ConsensusStrategy(Strategy):
         self,
         momentum_threshold: float = 0.03,   # Min 1m momentum for signal
         max_entry_price: int = 55,           # Won't pay more than 55c (raised from 50 for spread crossing)
-        min_entry_price: int = 38,           # Raised from 35 — avoid deep coin-flip zone
+        min_entry_price: int = 42,           # Raised from 38 — 30-41c bucket loses money per backtest
         min_seconds_remaining: int = 180,    # Need at least 3 min left
         min_agreement: int = 2,              # Min signals that must agree (out of 3)
         min_edge: float = 0.10,              # Raised from 5% to 10% — require more conviction

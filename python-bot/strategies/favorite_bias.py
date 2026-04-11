@@ -36,7 +36,7 @@ class FavoriteBiasStrategy(Strategy):
     def __init__(
         self,
         min_favorite_price: int = 70,   # Need at least 70c on one side
-        max_entry_price: int = 80,      # Won't pay more than 80c
+        max_entry_price: int = 76,      # Tightened from 82: entries above 76c have no edge on NO-side
         min_seconds_remaining: int = 180,  # Need at least 3 min
         asset_overrides: dict = None,    # e.g. {"KXETH": {"min_fav": 80}, "KXSOL": {"min_fav": 85}}
     ):
@@ -76,20 +76,9 @@ class FavoriteBiasStrategy(Strategy):
 
         yes_avg = (yes_bid + yes_ask) / 2
 
-        # YES is the strong favorite
-        if yes_avg >= min_fav and yes_ask <= max_entry:
-            # Confidence slightly above market-implied probability
-            confidence = min(0.92, yes_avg / 100 + 0.05)
-            return TradeRecommendation(
-                signal=Signal.BUY_YES,
-                confidence=confidence,
-                strategy_name=self.name,
-                reason=(
-                    f"Favorite-longshot: YES@{yes_avg:.0f}c is favorite, "
-                    f"bias says it wins more than {yes_avg:.0f}% of the time"
-                ),
-                max_price_cents=yes_ask,
-            )
+        # YES-side disabled: live data shows YES trades are -$30.57 (77.5% WR)
+        # while NO trades are +$11.34 (78.5% WR). The YES side has no edge
+        # because the entry prices are higher on average.
 
         # NO is the strong favorite
         no_avg = 100 - yes_avg

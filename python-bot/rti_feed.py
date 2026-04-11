@@ -54,6 +54,23 @@ EXCHANGE_CONFIG = {
         "bitstamp":  {"weight": 0.20, "url": "https://www.bitstamp.net/api/v2/ticker/solusd/", "parser": "bitstamp"},
         "binance":   {"weight": 0.30, "url": "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT", "parser": "binance"},
     },
+    "DOGE-USD": {
+        "coinbase":  {"weight": 0.35, "url": "https://api.coinbase.com/v2/prices/DOGE-USD/spot", "parser": "coinbase"},
+        "kraken":    {"weight": 0.25, "url": "https://api.kraken.com/0/public/Ticker?pair=DOGEUSD", "parser": "kraken"},
+        "binance":   {"weight": 0.40, "url": "https://api.binance.com/api/v3/ticker/price?symbol=DOGEUSDT", "parser": "binance"},
+    },
+    "XRP-USD": {
+        "coinbase":  {"weight": 0.35, "url": "https://api.coinbase.com/v2/prices/XRP-USD/spot", "parser": "coinbase"},
+        "kraken":    {"weight": 0.25, "url": "https://api.kraken.com/0/public/Ticker?pair=XRPUSD", "parser": "kraken"},
+        "binance":   {"weight": 0.40, "url": "https://api.binance.com/api/v3/ticker/price?symbol=XRPUSDT", "parser": "binance"},
+    },
+    "BNB-USD": {
+        "binance":   {"weight": 1.00, "url": "https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT", "parser": "binance"},
+    },
+    "HYPE-USD": {
+        # HYPE (Hyperliquid) — limited exchange availability, Binance only
+        "binance":   {"weight": 1.00, "url": "https://api.binance.com/api/v3/ticker/price?symbol=HYPEUSDT", "parser": "binance"},
+    },
 }
 
 
@@ -109,7 +126,15 @@ class RTIFeed:
     Drop-in replacement for PriceFeed — provides the same interface
     (current_price, momentum_1m, volatility, etc.) but backed by a
     volume-weighted composite price instead of a single exchange.
+
+    Supports two modes:
+    1. REST polling (legacy): call fetch_price() each tick
+    2. WebSocket streaming: call attach_ws() once, prices arrive automatically
     """
+
+    # Shared WebSocket feed — one instance serves all RTIFeed instances
+    _shared_ws = None
+    _shared_ws_lock = __import__("threading").Lock()
 
     def __init__(self, symbol: str = "BTC-USD", window_seconds: int = 1200):
         self.symbol = symbol
@@ -123,31 +148,69 @@ class RTIFeed:
         self._last_exchange_ts: dict[str, float] = {}
         # Fallback: if all exchanges fail, use last known price
         self._last_rti: Optional[float] = None
+        # WebSocket mode
+        self._ws_feed = None
+        self._ws_attached = False
+
+    @classmethod
+    def start_shared_ws(cls):
+        """Start the shared CryptoWSFeed (call once at bot startup)."""
+        with cls._shared_ws_lock:
+            if cls._shared_ws is None:
+                from crypto_ws import CryptoWSFeed
+                cls._shared_ws = CryptoWSFeed()
+                cls._shared_ws.start()
+                logger.info("[RTI] Shared crypto WebSocket feed started")
+
+    @classmethod
+    def stop_shared_ws(cls):
+        with cls._shared_ws_lock:
+            if cls._shared_ws:
+                cls._shared_ws.stop()
+                cls._shared_ws = None
+
+    def attach_ws(self):
+        """Attach to the shared WebSocket feed for real-time updates."""
+        if RTIFeed._shared_ws is None:
+            RTIFeed.start_shared_ws()
+        self._ws_feed = RTIFeed._shared_ws
+        self._ws_attached = True
 
     def fetch_price(self) -> Optional[float]:
         """
-        Fetch prices from all constituent exchanges and compute the
-        volume-weighted RTI composite price.
+        Compute the RTI composite price from available exchange data.
+
+        In WebSocket mode: reads latest prices from WebSocket feed (no HTTP).
+        In REST mode (legacy): fetches from all exchanges via HTTP.
         """
         now = time.time()
         raw_prices: dict[str, float] = {}
 
-        for exchange, config in self._exchange_config.items():
-            try:
-                resp = self._session.get(config["url"], timeout=3)
-                resp.raise_for_status()
-                parser = PARSERS[config["parser"]]
-                price = parser(resp.json())
-                if price and price > 0:
+        if self._ws_attached and self._ws_feed:
+            # WebSocket mode: read cached prices (no HTTP calls)
+            all_prices = self._ws_feed.get_all_prices(self.symbol)
+            for exchange, (price, ts) in all_prices.items():
+                if now - ts < 30 and price > 0:
                     raw_prices[exchange] = price
                     self._last_exchange_prices[exchange] = price
-                    self._last_exchange_ts[exchange] = now
-            except Exception:
-                # Use last known price if fresh enough (< 30s old)
-                if exchange in self._last_exchange_prices:
-                    age = now - self._last_exchange_ts.get(exchange, 0)
-                    if age < 30:
-                        raw_prices[exchange] = self._last_exchange_prices[exchange]
+                    self._last_exchange_ts[exchange] = ts
+        else:
+            # REST mode (legacy fallback)
+            for exchange, config in self._exchange_config.items():
+                try:
+                    resp = self._session.get(config["url"], timeout=3)
+                    resp.raise_for_status()
+                    parser = PARSERS[config["parser"]]
+                    price = parser(resp.json())
+                    if price and price > 0:
+                        raw_prices[exchange] = price
+                        self._last_exchange_prices[exchange] = price
+                        self._last_exchange_ts[exchange] = now
+                except Exception:
+                    if exchange in self._last_exchange_prices:
+                        age = now - self._last_exchange_ts.get(exchange, 0)
+                        if age < 30:
+                            raw_prices[exchange] = self._last_exchange_prices[exchange]
 
         if not raw_prices:
             return self._last_rti
@@ -257,6 +320,23 @@ class RTIFeed:
 
     def momentum_1m(self) -> Optional[float]:
         return self.momentum(lookback_seconds=60)
+
+    def momentum_smoothed(self, window: float = 90, periods: int = 3) -> Optional[float]:
+        """
+        Smoothed momentum: average of N momentum readings over a window.
+        Less noisy than a single-point comparison. Default: average of
+        3 readings spanning 90s each (covers ~4.5 min of data).
+        """
+        readings = []
+        for i in range(periods):
+            offset = i * window
+            current = self.price_at(offset)
+            past = self.price_at(offset + window)
+            if current is not None and past is not None and past > 0:
+                readings.append(((current - past) / past) * 100)
+        if not readings:
+            return None
+        return sum(readings) / len(readings)
 
     def volatility(self, lookback_seconds: float = 300) -> Optional[float]:
         cutoff = time.time() - lookback_seconds

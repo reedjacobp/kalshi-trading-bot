@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-from requests.exceptions import ConnectionError, HTTPError, Timeout
+from requests.exceptions import ChunkedEncodingError, ConnectionError, HTTPError, Timeout
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -101,7 +101,7 @@ class KalshiClient:
                     continue
                 resp.raise_for_status()
                 return resp.json()
-            except (ConnectionError, Timeout) as e:
+            except (ConnectionError, Timeout, ChunkedEncodingError) as e:
                 last_exc = e
                 wait = 2 ** attempt
                 logger.warning(f"Request failed (attempt {attempt + 1}/3): {e}, retrying in {wait}s")
@@ -129,7 +129,7 @@ class KalshiClient:
                     continue
                 resp.raise_for_status()
                 return resp.json()
-            except (ConnectionError, Timeout) as e:
+            except (ConnectionError, Timeout, ChunkedEncodingError) as e:
                 last_exc = e
                 wait = 2 ** attempt
                 logger.warning(f"Public GET failed (attempt {attempt + 1}/3): {e}, retrying in {wait}s")

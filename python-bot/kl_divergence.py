@@ -22,13 +22,16 @@ from collections import deque
 from typing import Optional
 
 
-# Historical correlation coefficients (15-min windows)
-# Calibrated from observed BTC/ETH/SOL co-movement
-CORRELATION = {
+# Default correlation coefficients (15-min windows)
+# Used as fallback when insufficient data for rolling computation
+DEFAULT_CORRELATION = {
     ("btc", "eth"): 0.67,
     ("btc", "sol"): 0.58,
     ("eth", "sol"): 0.62,
 }
+
+# Keep backward compat reference
+CORRELATION = DEFAULT_CORRELATION
 
 
 class KLDivergenceSignal:
@@ -47,13 +50,15 @@ class KLDivergenceSignal:
     def __init__(
         self,
         kl_threshold: float = 0.08,       # Min KL to signal (lowered from typical 0.2)
-        history_size: int = 30,            # Rolling window of price pairs
+        history_size: int = 480,           # ~4 hours at 30s intervals
         min_samples: int = 5,              # Need this many samples before signalling
+        min_corr_samples: int = 30,        # Need this many for rolling correlation
         correlation_decay: float = 0.95,   # EMA decay for running correlation
     ):
         self.kl_threshold = kl_threshold
         self.history_size = history_size
         self.min_samples = min_samples
+        self.min_corr_samples = min_corr_samples
         self.correlation_decay = correlation_decay
 
         # Current contract prices (YES side, in cents)
@@ -62,8 +67,11 @@ class KLDivergenceSignal:
 
         # History of price pairs for running correlation
         self._pair_history: dict[tuple, deque] = {}
-        for pair in CORRELATION:
+        for pair in DEFAULT_CORRELATION:
             self._pair_history[pair] = deque(maxlen=history_size)
+
+        # Cache for rolling correlations
+        self._rolling_correlations: dict[tuple, Optional[float]] = {}
 
     def update_price(self, asset: str, yes_price_cents: int):
         """Update the current contract price for an asset."""
@@ -82,6 +90,79 @@ class KLDivergenceSignal:
                         self._prices[b],
                         now,
                     ))
+
+    def _compute_rolling_correlation(self, asset_a: str, asset_b: str) -> Optional[float]:
+        """
+        Compute rolling Pearson correlation from price pair history.
+
+        Uses return series (not price levels) to avoid spurious correlation
+        from trending prices. Requires at least min_corr_samples data points.
+        """
+        pair = tuple(sorted([asset_a, asset_b]))
+        history = self._pair_history.get(pair)
+        if history is None or len(history) < self.min_corr_samples:
+            return None
+
+        # Extract price series
+        prices_a = [h[0] for h in history]
+        prices_b = [h[1] for h in history]
+
+        if len(prices_a) < 2:
+            return None
+
+        # Compute returns
+        returns_a = []
+        returns_b = []
+        for i in range(1, len(prices_a)):
+            if prices_a[i - 1] > 0 and prices_b[i - 1] > 0:
+                returns_a.append((prices_a[i] - prices_a[i - 1]) / prices_a[i - 1])
+                returns_b.append((prices_b[i] - prices_b[i - 1]) / prices_b[i - 1])
+
+        if len(returns_a) < self.min_corr_samples - 1:
+            return None
+
+        n = len(returns_a)
+        mean_a = sum(returns_a) / n
+        mean_b = sum(returns_b) / n
+
+        cov = sum((returns_a[i] - mean_a) * (returns_b[i] - mean_b) for i in range(n)) / n
+        var_a = sum((r - mean_a) ** 2 for r in returns_a) / n
+        var_b = sum((r - mean_b) ** 2 for r in returns_b) / n
+
+        if var_a <= 0 or var_b <= 0:
+            return None
+
+        corr = cov / (math.sqrt(var_a) * math.sqrt(var_b))
+        # Clamp to [-1, 1] for numerical safety
+        return max(-1.0, min(1.0, corr))
+
+    def get_correlation(self, asset_a: str, asset_b: str) -> float:
+        """
+        Get the current correlation estimate between two assets.
+        Uses rolling correlation if available, falls back to defaults.
+        """
+        pair = tuple(sorted([asset_a, asset_b]))
+        rolling = self._compute_rolling_correlation(asset_a, asset_b)
+        if rolling is not None:
+            self._rolling_correlations[pair] = rolling
+            return rolling
+        # Fallback to cached rolling or default
+        if pair in self._rolling_correlations and self._rolling_correlations[pair] is not None:
+            return self._rolling_correlations[pair]
+        return DEFAULT_CORRELATION.get(pair, DEFAULT_CORRELATION.get((pair[1], pair[0]), 0.5))
+
+    def get_current_correlations(self) -> dict[tuple, dict]:
+        """Return current correlation estimates for all pairs (for dashboard)."""
+        result = {}
+        for pair in DEFAULT_CORRELATION:
+            rolling = self._compute_rolling_correlation(pair[0], pair[1])
+            result[pair] = {
+                "rolling": rolling,
+                "default": DEFAULT_CORRELATION[pair],
+                "active": rolling if rolling is not None else DEFAULT_CORRELATION[pair],
+                "samples": len(self._pair_history.get(pair, [])),
+            }
+        return result
 
     def kl_divergence(self, asset_a: str, asset_b: str) -> Optional[float]:
         """
@@ -104,9 +185,8 @@ class KLDivergenceSignal:
         p_a = self._prices[asset_a] / 100.0  # Asset A's implied YES prob
         p_b = self._prices[asset_b] / 100.0  # Asset B's implied YES prob
 
-        # Adjust for correlation: given BTC is at p_a, what should ETH be?
-        pair = tuple(sorted([asset_a, asset_b]))
-        corr = CORRELATION.get(pair, CORRELATION.get((pair[1], pair[0]), 0.5))
+        # Use rolling correlation with fallback to defaults
+        corr = self.get_correlation(asset_a, asset_b)
 
         # Expected ETH YES prob given BTC YES prob and their correlation
         # Simplified model: E[p_b | p_a] = 0.5 + corr * (p_a - 0.5)
@@ -136,7 +216,7 @@ class KLDivergenceSignal:
         max_kl = 0.0
         best_direction = None
 
-        for pair, corr in CORRELATION.items():
+        for pair in DEFAULT_CORRELATION:
             if target_asset not in pair:
                 continue
 
@@ -151,7 +231,8 @@ class KLDivergenceSignal:
             if kl > max_kl:
                 max_kl = kl
 
-                # Determine direction of mispricing
+                # Determine direction of mispricing using rolling correlation
+                corr = self.get_correlation(target_asset, other)
                 p_other = self._prices[other] / 100.0
                 p_target = self._prices[target_asset] / 100.0
                 expected_target = 0.5 + corr * (p_other - 0.5)
