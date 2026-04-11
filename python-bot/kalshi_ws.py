@@ -15,6 +15,7 @@ import base64
 import csv
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -112,8 +113,10 @@ class KalshiWebSocket:
         """Set the series prefixes to track (client-side filter)."""
         self._series = list(series_prefixes)
 
-    def enable_recording(self, data_dir: str = "/mnt/d/datasets/prediction-market-analysis"):
+    def enable_recording(self, data_dir: str = None):
         """Enable persistent recording of price data for calibration."""
+        if data_dir is None:
+            data_dir = os.getenv("DATA_DIR", "/mnt/d/datasets/prediction-market-analysis")
         self._recorder = TickRecorder(data_dir)
         logger.info(f"[WS] Recording enabled: {data_dir}")
 

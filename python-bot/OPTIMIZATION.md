@@ -23,9 +23,11 @@ python bot.py --live
 
 | Source | Location | Purpose |
 |---|---|---|
-| Tick recordings | `/mnt/d/datasets/prediction-market-analysis/ticks/*.csv` | Real-time bid/ask for every contract update (primary training data) |
+| Tick recordings | `$DATA_DIR/ticks/*.csv` | Real-time bid/ask for every contract update (primary training data) |
 | Crypto prices | `data/prices/*.csv` | 1-minute BTC/ETH/SOL candles for buffer and momentum calculations |
 | Live trades | `data/live_trades.csv` | Ground truth for actual execution and fills |
+
+> `DATA_DIR` is set in `.env`. Defaults to `/mnt/d/datasets/prediction-market-analysis` locally, `/home/kalshi/data` on VPS.
 
 ### Optimization Process
 
@@ -61,6 +63,41 @@ Each cell is one of:
 - **Every 3-4 days** as new tick data accumulates (~15 trades/day adds meaningful signal)
 - **After market regime changes** — if volatility shifts significantly, params may need updating
 - **If live win rate drops below 95%** on any cell — something changed, re-optimize immediately
+
+## VPS Deployment & Re-Optimization Workflow
+
+The bot runs 24/7 on a VPS, collecting tick data. Optimization runs locally.
+
+```bash
+# 1. Sync tick data from VPS → local, push parquets local → VPS
+./sync-data.sh <vps-ip>
+
+# 2. Re-optimize locally (uses local tick data)
+cd python-bot
+python optimize_rr.py
+
+# 3. Commit & push updated params
+git add data/rr_params.json
+git commit -m "Re-optimize RR params"
+git push
+
+# 4. Deploy to VPS
+ssh root@<vps-ip> "cd /home/kalshi/kalshi-trading-bot && sudo -u kalshi git pull && systemctl restart kalshi-bot"
+```
+
+### Initial VPS Setup
+
+```bash
+# From your local machine, copy secrets to VPS first:
+scp ~/.config/kalshiqt/private_key.pem root@<vps-ip>:/tmp/kalshi_private_key.pem
+scp python-bot/.env root@<vps-ip>:/tmp/kalshi_bot.env
+
+# Then copy and run the deploy script:
+scp deploy.sh root@<vps-ip>:/tmp/deploy.sh
+ssh root@<vps-ip> "bash /tmp/deploy.sh"
+```
+
+See `deploy.sh` (repo root) for full details. The deploy script creates a `kalshi` user, installs deps, sets up systemd auto-restart, and configures `DATA_DIR`.
 
 ## What Happens on Bot Restart
 

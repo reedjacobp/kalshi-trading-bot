@@ -12,6 +12,7 @@ Usage:
 
 import csv
 import json
+import os
 import random
 import re
 import sys
@@ -487,7 +488,8 @@ def main():
     print("\n[1/4] Loading data...")
 
     # Use tick data for everything — parquet snapshots are too sparse for RR simulation
-    tick_dir = "/mnt/d/datasets/prediction-market-analysis/ticks"
+    data_dir = os.getenv("DATA_DIR", "/mnt/d/datasets/prediction-market-analysis")
+    tick_dir = os.path.join(data_dir, "ticks")
     all_tick_windows = load_tick_windows(tick_dir) if Path(tick_dir).exists() else []
     print(f"  Ticks: {len(all_tick_windows)} market windows")
 

@@ -830,7 +830,8 @@ class TradingBot:
         ])
 
         # Enable recording of live contract prices for future calibration
-        self.ws_feed.enable_recording("/mnt/d/datasets/prediction-market-analysis")
+        data_dir = os.getenv("DATA_DIR", "/mnt/d/datasets/prediction-market-analysis")
+        self.ws_feed.enable_recording(data_dir)
 
         # Inject WebSocket feed into all scanners for real-time prices
         for asset in self.assets.values():
