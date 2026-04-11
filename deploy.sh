@@ -144,6 +144,7 @@ Environment=NODE_ENV=production
 Environment=PORT=5000
 Environment=BOT_SSE_HOST=127.0.0.1
 Environment=BOT_SSE_PORT=5050
+EnvironmentFile=${BOT_DIR}/python-bot/.env
 
 # Safety limits
 MemoryMax=256M

@@ -12,6 +12,31 @@ declare module "http" {
   }
 }
 
+// Basic auth for dashboard access
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
+if (DASHBOARD_PASSWORD) {
+  app.use((req, res, next) => {
+    // Skip auth for health check
+    if (req.path === "/api/health") return next();
+
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Basic ")) {
+      res.setHeader("WWW-Authenticate", 'Basic realm="Kalshi Dashboard"');
+      return res.status(401).send("Authentication required");
+    }
+
+    const credentials = Buffer.from(authHeader.slice(6), "base64").toString();
+    const password = credentials.includes(":") ? credentials.split(":").slice(1).join(":") : credentials;
+
+    if (password !== DASHBOARD_PASSWORD) {
+      res.setHeader("WWW-Authenticate", 'Basic realm="Kalshi Dashboard"');
+      return res.status(401).send("Invalid password");
+    }
+
+    next();
+  });
+}
+
 app.use(
   express.json({
     verify: (req, _res, buf) => {
