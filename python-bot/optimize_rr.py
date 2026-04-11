@@ -658,6 +658,16 @@ def main():
     print("\n[4/4] Saving...")
     out = Path("data/rr_params.json")
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Back up previous params with timestamp
+    if out.exists():
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        backup = out.parent / f"rr_params_{ts}.json"
+        import shutil
+        shutil.copy2(out, backup)
+        print(f"  Backed up previous params to {backup}")
+
     with open(out, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"  Saved to {out}")
