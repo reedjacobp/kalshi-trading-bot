@@ -389,6 +389,7 @@ class TradeLogger:
                 "fees": round(fee, 2),
                 "profit_after_fees": round(profit - fee, 2),
                 "order_type": order_type,
+                "order_id": e.get("order_id", ""),
             })
 
         return {
@@ -875,7 +876,16 @@ class TradingBot:
         # Strategies
         self.strategies = self._init_strategies(config["strategy"])
 
-        # Early exit monitor for open positions
+        # Early exit monitor for open positions.
+        # Disabled 2026-04-13: RR thesis is 98% WR hold-to-settlement; stop
+        # losses were firing on normal adverse moves and then the market was
+        # recovering before settlement, turning would-be wins into -$13 to
+        # -$17 whipsaw losses. Observed 4 such trades on 2026-04-13 totaling
+        # ~$60 of unnecessary losses.
+        # The monitor instance is still constructed so the rest of the
+        # codebase doesn't break, but _check_early_exits and _force_early_exit
+        # are gated by self._early_exits_enabled below.
+        self._early_exits_enabled = False
         self.exit_monitor = EarlyExitMonitor(
             stop_loss_cents=15,
             take_profit_cents=10,
@@ -1165,6 +1175,10 @@ class TradingBot:
         self._log(f"  Max Loss:   ${self.config['max_daily_loss']:.2f}/day")
         self._log(f"  Mode:       {'PAPER' if self.config['paper_trade'] else 'LIVE'}")
         self._log(f"  Polling:    full speed (WebSocket)")
+        self._log(
+            f"  Early exits: {'ENABLED' if self._early_exits_enabled else 'DISABLED'} "
+            f"(hold to settlement)"
+        )
         # Start WebSocket feeds for real-time data
         self.ws_feed.start()
         RTIFeed.start_shared_ws()
@@ -1536,7 +1550,12 @@ class TradingBot:
                         # BTC moved slightly toward the strike but is still
                         # comfortably on the right side.
                         record = self.risk_mgr.open_positions[ticker_bayes]
-                        if posterior is not None and self.bayesian.should_exit(ticker_bayes, record.price_cents / 100.0):
+                        if (posterior is not None
+                            and self.bayesian.should_exit(ticker_bayes, record.price_cents / 100.0)
+                            and self._early_exits_enabled):
+                            # Only log and attempt exit when the early-exit
+                            # mechanism is enabled. Otherwise the log spammed
+                            # every tick with no corresponding action.
                             self._log(f"  [BAYES] Posterior collapsed to {posterior:.0%} for {ticker_bayes}, triggering early exit check")
                             self._check_early_exits(market, scanner, feed)
 
@@ -2319,6 +2338,7 @@ class TradingBot:
                     "fees": round(record.entry_fee_usd, 2),
                     "profit_after_fees": 0,  # Updated on settlement
                     "order_type": "maker" if is_maker else "taker",
+                    "order_id": order_id,
                 })
                 if len(self._dashboard_trades) > 500:
                     self._dashboard_trades.pop()
@@ -2328,6 +2348,10 @@ class TradingBot:
 
     def _check_early_exits(self, market: dict, scanner, price_feed):
         """Check open positions on this market for early exit signals."""
+        # Early exits disabled 2026-04-13 — hold every RR position to
+        # settlement. See __init__ for the rationale (stop-loss whipsaws).
+        if not self._early_exits_enabled:
+            return
         ticker = market.get("ticker", "")
         if ticker not in self.risk_mgr.open_positions:
             return
@@ -2475,6 +2499,11 @@ class TradingBot:
         Bypasses the exit_monitor's stop loss threshold — the Bayesian signal
         is faster and more accurate than stale orderbook prices.
         """
+        # Early exits disabled 2026-04-13 — hold every RR position to
+        # settlement. The bayesian-collapse exit was also whipsawing on the
+        # same trades as the stop loss.
+        if not self._early_exits_enabled:
+            return
         if ticker not in self.risk_mgr.open_positions:
             return
 

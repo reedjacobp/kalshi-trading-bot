@@ -21,6 +21,7 @@ export const tradeSchema = z.object({
   fees: z.number(),
   profit_after_fees: z.number(),
   order_type: z.enum(["maker", "taker"]).optional(),
+  order_id: z.string().optional(),
 });
 
 export const marketDataSchema = z.object({

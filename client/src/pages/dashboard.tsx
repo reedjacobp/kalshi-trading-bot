@@ -1090,12 +1090,13 @@ function TradeHistoryTable({ trades: rawTrades, isPaper }: { trades: TickData["t
               <SortHeader col="fees" align="right">Fees</SortHeader>
               <SortHeader col="net" align="right">Net P&L</SortHeader>
               <SortHeader col="status" align="right">Status</SortHeader>
+              <th className="text-slate-500 uppercase tracking-wider text-left">Order ID</th>
             </tr>
           </thead>
           <tbody>
             {displayTrades.length === 0 ? (
               <tr>
-                <td colSpan={12} className="text-center py-8 text-slate-600">
+                <td colSpan={13} className="text-center py-8 text-slate-600">
                   {trades.length === 0 ? "No trades yet — waiting for signals" : "No trades match"}
                 </td>
               </tr>
@@ -1182,6 +1183,20 @@ function TradeHistoryTable({ trades: rawTrades, isPaper }: { trades: TickData["t
                     >
                       {trade.outcome === "pending" ? "⏳ pending" : trade.outcome}
                     </span>
+                  </td>
+                  <td className="py-2 pl-3 text-slate-500 font-mono text-[10px]">
+                    {trade.order_id ? (
+                      <button
+                        type="button"
+                        onClick={() => navigator.clipboard?.writeText(trade.order_id!)}
+                        title={`${trade.order_id} (click to copy)`}
+                        className="hover:text-slate-300 cursor-pointer"
+                      >
+                        {trade.order_id.slice(0, 8)}
+                      </button>
+                    ) : (
+                      <span className="text-slate-700">—</span>
+                    )}
                   </td>
                 </tr>
               ))
