@@ -175,71 +175,181 @@ function KPICard({
   );
 }
 
-function PnLCard({
+function StatsRow({
   stats,
-  icon: Icon,
+  trades,
 }: {
   stats: TickData["stats"];
-  icon: React.ElementType;
+  trades: TickData["trades"];
 }) {
-  const [period, setPeriod] = React.useState<"daily" | "weekly" | "monthly" | "alltime">("daily");
+  const [period, setPeriod] = React.useState<string>("daily");
+  const [customDays, setCustomDays] = React.useState<number>(2);
 
-  const periods = {
-    daily: { gross: stats.daily_pnl, net: stats.daily_pnl_after_fees, fees: stats.daily_fees ?? 0 },
-    weekly: { gross: stats.weekly_pnl ?? 0, net: stats.weekly_pnl_net ?? 0, fees: stats.weekly_fees ?? 0 },
-    monthly: { gross: stats.monthly_pnl ?? 0, net: stats.monthly_pnl_net ?? 0, fees: stats.monthly_fees ?? 0 },
-    alltime: { gross: stats.alltime_pnl ?? stats.total_pnl, net: stats.alltime_pnl_net ?? stats.total_pnl_after_fees, fees: stats.alltime_fees ?? stats.total_fees },
-  };
+  // Recompute cutoff every time trades change (SSE update) or period changes
+  const filtered = React.useMemo(() => {
+    const now = new Date();
+    let cutoff: Date;
+    switch (period) {
+      case "daily": {
+        // Midnight Pacific (UTC-7) = 07:00 UTC
+        // Compute today's date in Pacific time, then convert back to UTC
+        const utcNow = now.getTime();
+        const pacificMs = utcNow - 7 * 3600000;
+        const pacificDate = new Date(pacificMs);
+        // Midnight UTC of that Pacific date
+        const midnightUTC = Date.UTC(pacificDate.getUTCFullYear(), pacificDate.getUTCMonth(), pacificDate.getUTCDate());
+        // Add 7 hours to get midnight Pacific in UTC
+        cutoff = new Date(midnightUTC + 7 * 3600000);
+        break;
+      }
+      case "weekly":
+        cutoff = new Date(now.getTime() - 7 * 86400000);
+        break;
+      case "monthly":
+        cutoff = new Date(now.getTime() - 30 * 86400000);
+        break;
+      case "custom":
+        cutoff = new Date(now.getTime() - customDays * 86400000);
+        break;
+      default:
+        cutoff = new Date(0); // alltime
+    }
+    return trades.filter(t => t.outcome !== "pending" && new Date(t.time) >= cutoff);
+  }, [trades, period, customDays]);
 
-  const p = periods[period];
-  const trend = p.net > 0 ? "text-emerald-400" : p.net < 0 ? "text-red-400" : "text-slate-400";
+  const wins = filtered.filter(t => t.outcome === "win").length;
+  const losses = filtered.filter(t => t.outcome === "loss").length;
+  const total = wins + losses;
+  const winRate = total > 0 ? (wins / total) * 100 : 0;
+
+  // P&L from stats (server-computed) for standard periods, client-computed for custom
+  const pnl = React.useMemo(() => {
+    if (period === "custom" || period === "alltime") {
+      const gross = filtered.reduce((s, t) => s + t.profit, 0);
+      const fees = filtered.reduce((s, t) => s + t.fees, 0);
+      return { gross, net: gross - fees, fees };
+    }
+    const periods: Record<string, { gross: number; net: number; fees: number }> = {
+      daily: { gross: stats.daily_pnl, net: stats.daily_pnl_after_fees, fees: stats.daily_fees ?? 0 },
+      weekly: { gross: stats.weekly_pnl ?? 0, net: stats.weekly_pnl_net ?? 0, fees: stats.weekly_fees ?? 0 },
+      monthly: { gross: stats.monthly_pnl ?? 0, net: stats.monthly_pnl_net ?? 0, fees: stats.monthly_fees ?? 0 },
+    };
+    return periods[period] ?? { gross: 0, net: 0, fees: 0 };
+  }, [period, stats, filtered]);
+
+  // For alltime, prefer server stats
+  const displayPnl = period === "alltime" ? {
+    gross: stats.alltime_pnl ?? stats.total_pnl,
+    net: stats.alltime_pnl_net ?? stats.total_pnl_after_fees,
+    fees: stats.alltime_fees ?? stats.total_fees,
+  } : pnl;
+
+  const trend = displayPnl.net > 0 ? "text-emerald-400" : displayPnl.net < 0 ? "text-red-400" : "text-slate-400";
+  const wrTrend = total === 0 ? "text-slate-400" : winRate >= 60 ? "text-emerald-400" : winRate >= 40 ? "text-slate-400" : "text-red-400";
 
   return (
-    <motion.div
-      className="bg-[hsl(222,33%,7%)] border border-[hsl(220,20%,12%)] rounded-lg p-4 flex flex-col gap-1 col-span-2"
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.3 }}
-    >
-      <div className="flex items-center justify-between">
-        <span className="text-xs text-slate-400 uppercase tracking-wider font-medium">
-          P&L
-        </span>
-        <div className="flex items-center gap-2">
-          <select
-            value={period}
-            onChange={(e) => setPeriod(e.target.value as typeof period)}
-            className="text-[10px] bg-[hsl(222,33%,10%)] border border-[hsl(220,20%,15%)] text-slate-400 rounded px-2 py-0.5 cursor-pointer"
-          >
-            <option value="daily">Daily</option>
-            <option value="weekly">Weekly</option>
-            <option value="monthly">Monthly</option>
-            <option value="alltime">All-Time</option>
-          </select>
-          <Icon size={14} className="text-slate-500" />
+    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      {/* Period selector — shared across all tiles */}
+      <motion.div
+        className="col-span-2 md:col-span-4 flex items-center gap-2 px-1"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+      >
+        <select
+          value={period}
+          onChange={(e) => setPeriod(e.target.value)}
+          className="text-[11px] bg-[hsl(222,33%,10%)] border border-[hsl(220,20%,15%)] text-slate-400 rounded px-2 py-1 cursor-pointer"
+        >
+          <option value="daily">Daily</option>
+          <option value="weekly">Weekly</option>
+          <option value="monthly">Monthly</option>
+          <option value="alltime">All-Time</option>
+          <option value="custom">Custom</option>
+        </select>
+        {period === "custom" && (
+          <div className="flex items-center gap-1">
+            <span className="text-[11px] text-slate-500">Last</span>
+            <input
+              type="number"
+              min={1}
+              max={365}
+              value={customDays}
+              onChange={(e) => setCustomDays(Math.max(1, parseInt(e.target.value) || 1))}
+              className="w-12 text-[11px] bg-[hsl(222,33%,10%)] border border-[hsl(220,20%,15%)] text-slate-300 rounded px-1.5 py-1 text-center tabular-nums"
+            />
+            <span className="text-[11px] text-slate-500">days</span>
+          </div>
+        )}
+      </motion.div>
+
+      {/* P&L tile */}
+      <motion.div
+        className="bg-[hsl(222,33%,7%)] border border-[hsl(220,20%,12%)] rounded-lg p-4 flex flex-col gap-1 col-span-2"
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.3 }}
+      >
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-slate-400 uppercase tracking-wider font-medium">P&L</span>
+          <TrendingUp size={14} className="text-slate-500" />
         </div>
-      </div>
-      <div className="flex items-baseline gap-3">
-        <div className="flex flex-col">
-          <span className={`text-xl font-semibold ${trend} tabular-nums`}>
-            {p.gross >= 0 ? "+" : ""}${p.gross.toFixed(2)}
+        <div className="flex items-baseline gap-3">
+          <div className="flex flex-col">
+            <span className={`text-xl font-semibold ${trend} tabular-nums`}>
+              {displayPnl.gross >= 0 ? "+" : ""}${displayPnl.gross.toFixed(2)}
+            </span>
+            <span className="text-[9px] text-slate-600 uppercase">Gross</span>
+          </div>
+          <div className="flex flex-col">
+            <span className={`text-xl font-semibold ${trend} tabular-nums`}>
+              {displayPnl.net >= 0 ? "+" : ""}${displayPnl.net.toFixed(2)}
+            </span>
+            <span className="text-[9px] text-slate-600 uppercase">Net</span>
+          </div>
+          <div className="flex flex-col">
+            <span className="text-xl font-semibold text-slate-500 tabular-nums">
+              ${displayPnl.fees.toFixed(2)}
+            </span>
+            <span className="text-[9px] text-slate-600 uppercase">Fees</span>
+          </div>
+        </div>
+      </motion.div>
+
+      {/* Win Rate tile */}
+      <motion.div
+        className="bg-[hsl(222,33%,7%)] border border-[hsl(220,20%,12%)] rounded-lg p-4 flex flex-col gap-1"
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.3 }}
+      >
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-slate-400 uppercase tracking-wider font-medium">Win Rate</span>
+          <Target size={14} className="text-slate-500" />
+        </div>
+        <div className={`text-xl font-semibold ${wrTrend} tabular-nums`}>
+          {winRate.toFixed(1)}%
+        </div>
+        <span className="text-[9px] text-slate-600">{wins}W / {losses}L</span>
+      </motion.div>
+
+      {/* Trades tile */}
+      <motion.div
+        className="bg-[hsl(222,33%,7%)] border border-[hsl(220,20%,12%)] rounded-lg p-4 flex flex-col gap-1"
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.3 }}
+      >
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-slate-400 uppercase tracking-wider font-medium">
+            {stats.pending > 0 ? `Trades (${stats.pending} open)` : "Trades"}
           </span>
-          <span className="text-[9px] text-slate-600 uppercase">Gross</span>
+          <Activity size={14} className="text-slate-500" />
         </div>
-        <div className="flex flex-col">
-          <span className={`text-xl font-semibold ${trend} tabular-nums`}>
-            {p.net >= 0 ? "+" : ""}${p.net.toFixed(2)}
-          </span>
-          <span className="text-[9px] text-slate-600 uppercase">Net</span>
+        <div className="text-xl font-semibold text-slate-400 tabular-nums">
+          {total}
         </div>
-        <div className="flex flex-col">
-          <span className="text-xl font-semibold text-slate-500 tabular-nums">
-            ${p.fees.toFixed(2)}
-          </span>
-          <span className="text-[9px] text-slate-600 uppercase">Fees</span>
-        </div>
-      </div>
-    </motion.div>
+      </motion.div>
+    </div>
   );
 }
 
@@ -1225,56 +1335,34 @@ export default function Dashboard() {
               </div>
             )}
 
-            {/* KPI Row */}
-            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
-              {data.stats.live_balance != null && (
-                <KPICard
-                  label="Balance"
-                  value={data.stats.live_balance}
-                  prefix="$"
-                  decimals={2}
-                  icon={DollarSign}
-                  trend="neutral"
-                />
-              )}
-              {data.stats.paper_balance != null && (
-                <KPICard
-                  label="Paper Balance"
-                  value={data.stats.paper_balance}
-                  prefix="$"
-                  decimals={2}
-                  icon={Wallet}
-                  trend={data.stats.paper_balance > 100 ? "up" : data.stats.paper_balance < 100 ? "down" : "neutral"}
-                />
-              )}
-              <PnLCard
-                stats={data.stats}
-                icon={TrendingUp}
-              />
-              <KPICard
-                label="Win Rate"
-                value={data.stats.win_rate}
-                suffix="%"
-                decimals={1}
-                icon={Target}
-                trend={
-                  data.stats.total_trades === 0
-                    ? "neutral"
-                    : data.stats.win_rate >= 60
-                      ? "up"
-                      : data.stats.win_rate >= 40
-                        ? "neutral"
-                        : "down"
-                }
-              />
-              <KPICard
-                label={data.stats.pending > 0 ? `Trades (${data.stats.pending} open)` : "Trades"}
-                value={data.stats.total_trades}
-                decimals={0}
-                icon={Activity}
-                trend="neutral"
-              />
-            </div>
+            {/* Balance */}
+            {(data.stats.live_balance != null || data.stats.paper_balance != null) && (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                {data.stats.live_balance != null && (
+                  <KPICard
+                    label="Balance"
+                    value={data.stats.live_balance}
+                    prefix="$"
+                    decimals={2}
+                    icon={DollarSign}
+                    trend="neutral"
+                  />
+                )}
+                {data.stats.paper_balance != null && (
+                  <KPICard
+                    label="Paper Balance"
+                    value={data.stats.paper_balance}
+                    prefix="$"
+                    decimals={2}
+                    icon={Wallet}
+                    trend={data.stats.paper_balance > 100 ? "up" : data.stats.paper_balance < 100 ? "down" : "neutral"}
+                  />
+                )}
+              </div>
+            )}
+
+            {/* P&L / Win Rate / Trades — unified period selector */}
+            <StatsRow stats={data.stats} trades={data.trades} />
 
             {/* Chart */}
             <TabbedChart data={data} />

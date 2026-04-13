@@ -29,6 +29,63 @@ import numpy as np
 import pandas as pd
 
 
+# ── Slippage Model (from Kalshi fill data) ───────────────────────
+
+def load_slippage_model(kalshi_csv: str) -> dict[int, float]:
+    """
+    Compute average slippage penalty per entry price level from Kalshi fills.
+
+    Slippage is estimated as the average taker fees per contract at each
+    entry price level (94-99c range). This captures the real cost of
+    crossing the spread that perfect-fill simulation misses.
+
+    Returns: dict mapping entry_price_cents -> slippage_cents_per_contract
+    """
+    if not os.path.exists(kalshi_csv):
+        print(f"  [slippage] Kalshi CSV not found at {kalshi_csv}, using defaults")
+        return {}
+
+    # Accumulate per-price-level stats from RR-range fills
+    by_price = defaultdict(lambda: {"total_qty": 0, "total_fees": 0, "count": 0})
+    with open(kalshi_csv, newline="") as f:
+        for row in csv.DictReader(f):
+            if row["type"] != "trade":
+                continue
+            ep = int(row["entry_price_cents"])
+            if 94 <= ep <= 99:
+                qty = int(row["quantity"])
+                fees = int(row["open_fees_cents"]) + int(row["close_fees_cents"])
+                d = by_price[ep]
+                d["total_qty"] += qty
+                d["total_fees"] += fees
+                d["count"] += 1
+
+    slippage = {}
+    for price, d in sorted(by_price.items()):
+        if d["total_qty"] > 0:
+            # Fee-based slippage: actual fees paid per contract
+            fee_per_contract = d["total_fees"] / d["total_qty"]
+            # Add a fixed spread-crossing estimate (empirical: ~0.3c avg)
+            # This accounts for the ask being slightly above mid when we buy
+            spread_penalty = 0.3
+            slippage[price] = fee_per_contract + spread_penalty
+        else:
+            slippage[price] = 0.5  # Default if no data
+
+    return slippage
+
+
+# Global slippage model, loaded once at startup
+SLIPPAGE_MODEL: dict[int, float] = {}
+
+
+def get_slippage_cents(entry_price_cents: int) -> float:
+    """Get slippage penalty in cents for a given entry price."""
+    if not SLIPPAGE_MODEL:
+        return 0.5  # Conservative default if no model loaded
+    return SLIPPAGE_MODEL.get(entry_price_cents, 0.5)
+
+
 # ── Parameter Space ───────────────────────────────────────────────
 
 PARAM_RANGES = {
@@ -364,7 +421,13 @@ def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
 
         won = (e["side"] == result)
         contracts = max(1, int(10.0 / (e["entry_price"] / 100.0)))
-        profit = contracts * (100 - e["entry_price"]) / 100.0 if won else -contracts * e["entry_price"] / 100.0
+        # Apply slippage penalty from empirical Kalshi fill data
+        slippage_per_contract = get_slippage_cents(int(e["entry_price"])) / 100.0
+        slippage_cost = contracts * slippage_per_contract
+        if won:
+            profit = contracts * (100 - e["entry_price"]) / 100.0 - slippage_cost
+        else:
+            profit = -contracts * e["entry_price"] / 100.0 - slippage_cost
         return {"won": won, "profit": profit}
 
     return None
@@ -489,6 +552,17 @@ def main():
 
     # Use tick data for everything — parquet snapshots are too sparse for RR simulation
     data_dir = os.getenv("DATA_DIR", "/mnt/d/datasets/prediction-market-analysis")
+
+    # Load slippage model from Kalshi fill data
+    global SLIPPAGE_MODEL
+    kalshi_csv = os.path.join(data_dir, "from_kalshi", "Kalshi-Transactions-2026.csv")
+    SLIPPAGE_MODEL = load_slippage_model(kalshi_csv)
+    if SLIPPAGE_MODEL:
+        print("  Slippage model (cents/contract):")
+        for price, slip in sorted(SLIPPAGE_MODEL.items()):
+            print(f"    {price}c entry -> {slip:.2f}c slippage")
+    else:
+        print("  No slippage model loaded, using 0.5c default")
     tick_dir = os.path.join(data_dir, "ticks")
     all_tick_windows = load_tick_windows(tick_dir) if Path(tick_dir).exists() else []
     print(f"  Ticks: {len(all_tick_windows)} market windows")

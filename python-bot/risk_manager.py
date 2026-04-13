@@ -270,15 +270,14 @@ class RiskManager:
             record.outcome = "win"
             record.payout_usd = record.contracts * 1.00  # $1 per winning contract
             record.profit_usd = record.payout_usd - record.stake_usd
-            # Settlement fee on the winning payout (treated as a new "trade" at $1.00)
-            record.settle_fee_usd = kalshi_taker_fee(record.contracts, 100 - record.price_cents)
+            record.settle_fee_usd = 0.0  # Kalshi does not charge a settlement fee
         else:
             record.outcome = "loss"
             record.payout_usd = 0.0
             record.profit_usd = -record.stake_usd
-            record.settle_fee_usd = 0.0  # No settlement fee on losses
+            record.settle_fee_usd = 0.0
             self._last_loss_ts = time.time()
-        record.profit_after_fees = record.profit_usd - record.entry_fee_usd - record.settle_fee_usd
+        record.profit_after_fees = record.profit_usd - record.entry_fee_usd
 
     def stats_summary(self) -> str:
         """Human-readable summary of trading stats."""
