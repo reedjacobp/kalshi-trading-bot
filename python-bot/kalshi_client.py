@@ -249,6 +249,7 @@ class KalshiClient:
         yes_price: int = None,
         client_order_id: str = None,
         expiration_ts: int = None,
+        reduce_only: bool = False,
     ) -> dict:
         """
         Place an order on a market.
@@ -262,6 +263,10 @@ class KalshiClient:
             yes_price: Price in cents (1-99), required for limit orders
             client_order_id: Unique ID for deduplication (auto-generated if not provided)
             expiration_ts: Unix timestamp for order expiration (optional)
+            reduce_only: If True, the order can ONLY reduce an existing
+                position (never open a new one). Required on exit/sell
+                orders — without it, Kalshi creates a new offsetting
+                position instead of closing the existing long.
         """
         if client_order_id is None:
             client_order_id = str(uuid.uuid4())
@@ -278,6 +283,8 @@ class KalshiClient:
             order_data["yes_price"] = yes_price
         if expiration_ts is not None:
             order_data["expiration_ts"] = expiration_ts
+        if reduce_only:
+            order_data["reduce_only"] = True
 
         return self._request("POST", "/portfolio/orders", data=order_data)
 

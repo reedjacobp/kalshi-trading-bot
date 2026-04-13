@@ -1806,21 +1806,35 @@ class TradingBot:
             # Fall back to cached market data
             yes_bid, yes_ask = scanner.parse_yes_price(market)
 
-        # Sanity check: cross-verify book-derived ask against the market's own
-        # yes_ask field. A large divergence means the book parse is stale or
-        # malformed — skip the trade rather than act on fantasy prices.
-        # (Root cause of the 2026-04-13 bad-fill incident.)
-        # Threshold 10¢: observed normal divergence is 0-4¢ on near-the-money
-        # markets; the incident had ~80¢ divergence, so 10¢ is a wide margin.
-        if yes_bid is not None and yes_ask is not None:
-            market_bid, market_ask = scanner.parse_yes_price(market)
-            if market_ask is not None and abs(yes_ask - market_ask) > 10:
-                self._log(
-                    f"      [SANITY] {ticker}: book yes_ask={yes_ask} diverges from "
-                    f"market yes_ask={market_ask} — skipping trade",
-                    level="warning",
-                )
-                return
+        # Sanity check: cross-verify book-derived prices against the
+        # market's own yes_bid/yes_ask fields. Divergence on EITHER side
+        # means the book parse is stale or the market has flipped — skip
+        # the trade rather than act on fantasy prices.
+        #
+        # Checks BOTH bid and ask independently: a one-sided book collapse
+        # (e.g., all NO bids pulled after YES becomes favorite) leaves
+        # yes_ask=None but yes_bid=99, which can produce a bogus NO-side
+        # ask of 1¢ in _maybe_trade's exec_price calculation. The previous
+        # `if yes_bid is not None AND yes_ask is not None` gate silently
+        # bypassed this case.
+        #
+        # Threshold 10¢: observed normal divergence on near-the-money
+        # markets is 0-4¢; the 2026-04-13 incidents had ~80-95¢ divergence.
+        market_bid, market_ask = scanner.parse_yes_price(market)
+        if yes_ask is not None and market_ask is not None and abs(yes_ask - market_ask) > 10:
+            self._log(
+                f"      [SANITY] {ticker}: book yes_ask={yes_ask} diverges from "
+                f"market yes_ask={market_ask} — skipping trade",
+                level="warning",
+            )
+            return
+        if yes_bid is not None and market_bid is not None and abs(yes_bid - market_bid) > 10:
+            self._log(
+                f"      [SANITY] {ticker}: book yes_bid={yes_bid} diverges from "
+                f"market yes_bid={market_bid} — skipping trade",
+                level="warning",
+            )
+            return
 
         # ── Shadow tracking: record what disabled strategies WOULD do,
         # so the matrix can evaluate them for future enablement.
@@ -1928,6 +1942,27 @@ class TradingBot:
                 # <5 min: cross at the ask (taker, guaranteed fill)
                 exec_price = min(ask_price, max_price)
                 is_maker = False
+
+            # Hard floor: never place an RR order outside the strategy's
+            # [min_contract_price, max_entry_price] band. Prevents the
+            # 2026-04-13 "NO@1c" incident where a market flipped between
+            # RR evaluation and order submission, causing exec_price to
+            # collapse while the sanity check was bypassed by a one-sided
+            # book (no_bids empty → yes_ask None → sanity check skipped).
+            # This guard catches the failure unconditionally at the site
+            # where exec_price is known to be final.
+            if name == "resolution_rider":
+                strat = self.strategies.get("resolution_rider")
+                strat_min = strat.min_contract_price if strat else 95
+                strat_max = strat.max_entry_price if strat else 98
+                if exec_price < strat_min or exec_price > strat_max:
+                    self._log(
+                        f"  [SKIP] {name}: exec_price {exec_price}c outside "
+                        f"[{strat_min}, {strat_max}]c band "
+                        f"(book may have moved between signal and submission)",
+                        level="warning",
+                    )
+                    continue
 
             # Risk check using actual execution price
             approved, reason = self.risk_mgr.approve_trade(
@@ -2363,6 +2398,10 @@ class TradingBot:
                 # paths can't fire a second sell while this one is in flight.
                 self._exit_pending.add(ticker)
 
+                # reduce_only is CRITICAL: without it, Kalshi treats "sell yes"
+                # as opening a new short (equivalent to a new NO long) rather
+                # than closing the existing long YES. That's what caused the
+                # 2026-04-13 XRP "buy NO at 20c" incident.
                 result = self.client.place_order(
                     ticker=ticker,
                     action="sell",
@@ -2370,6 +2409,7 @@ class TradingBot:
                     count=record.contracts,
                     order_type="limit",
                     yes_price=sell_yes_price,
+                    reduce_only=True,
                 )
 
                 order_status = result.get("order", {}).get("status", "")
@@ -2466,6 +2506,7 @@ class TradingBot:
                 sell_yes_price = yes_bid if sell_side == "yes" else yes_ask
                 # Mark pending BEFORE submitting (cross-path dedup).
                 self._exit_pending.add(ticker)
+                # reduce_only=True: close the existing position, don't open a new one.
                 result = self.client.place_order(
                     ticker=ticker,
                     action="sell",
@@ -2473,6 +2514,7 @@ class TradingBot:
                     count=record.contracts,
                     order_type="limit",
                     yes_price=sell_yes_price,
+                    reduce_only=True,
                 )
 
                 order_status = result.get("order", {}).get("status", "")
@@ -3086,10 +3128,12 @@ class TradingBot:
                             if sell_price is not None:
                                 self._log(f"      [UNWIND] Placing sell order for {t.ticker}...")
                                 try:
+                                    # reduce_only=True: close the position, don't open a new one.
                                     result = self.client.place_order(
                                         ticker=t.ticker, action="sell", side=t.side,
                                         count=t.contracts, order_type="limit",
                                         yes_price=sell_price,
+                                        reduce_only=True,
                                     )
                                     oid = result.get("order", {}).get("order_id", "unknown")
                                     self._log(f"      [UNWIND] Sell order placed: {oid}")
