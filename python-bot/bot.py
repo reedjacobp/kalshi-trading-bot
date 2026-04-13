@@ -67,6 +67,53 @@ from broad_scanner import BroadScanner
 from strategy_tracker import StrategyTracker
 
 
+# ─── Orderbook parsing ───────────────────────────────────────────────────────
+
+def parse_book_top(book: dict) -> tuple:
+    """
+    Extract top-of-book (yes_bid, yes_ask) in cents from a Kalshi orderbook
+    response. Handles both the current `orderbook_fp` schema with dollar
+    strings and the legacy `orderbook` schema with cent integers.
+
+    Kalshi returns bid levels sorted ASCENDING (worst→best); the best bid is
+    at index [-1]. Only bids are returned (no asks); the YES ask is derived
+    from the best NO bid as (100 - best_no_bid) in cents.
+
+    Returns (yes_bid_cents, yes_ask_cents), either may be None if missing.
+    """
+    yes_levels = []
+    no_levels = []
+
+    fp = book.get("orderbook_fp")
+    if fp:
+        for lvl in fp.get("yes_dollars", []) or []:
+            try:
+                yes_levels.append(int(round(float(lvl[0]) * 100)))
+            except (ValueError, TypeError, IndexError):
+                continue
+        for lvl in fp.get("no_dollars", []) or []:
+            try:
+                no_levels.append(int(round(float(lvl[0]) * 100)))
+            except (ValueError, TypeError, IndexError):
+                continue
+    else:
+        legacy = book.get("orderbook", {}) or {}
+        for lvl in legacy.get("yes", []) or []:
+            try:
+                yes_levels.append(int(lvl[0]))
+            except (ValueError, TypeError, IndexError):
+                continue
+        for lvl in legacy.get("no", []) or []:
+            try:
+                no_levels.append(int(lvl[0]))
+            except (ValueError, TypeError, IndexError):
+                continue
+
+    yes_bid = yes_levels[-1] if yes_levels else None
+    yes_ask = (100 - no_levels[-1]) if no_levels else None
+    return yes_bid, yes_ask
+
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 def load_config():
@@ -139,6 +186,7 @@ class TradeLogger:
         "time", "run_id", "strategy", "ticker", "side", "price_cents",
         "contracts", "stake_usd", "order_id", "outcome",
         "payout_usd", "profit_usd", "reason", "confidence",
+        "order_type", "fees_usd",
     ]
 
     def __init__(self, csv_path: str = "data/trades.csv", run_id: str = ""):
@@ -182,6 +230,18 @@ class TradeLogger:
                 row.append("")  # Empty confidence for historical rows
             needs_rewrite = True
 
+        # Migration 3: add order_type and fees_usd columns
+        if "order_type" not in header:
+            header.append("order_type")
+            for row in rows:
+                row.append("")
+            needs_rewrite = True
+        if "fees_usd" not in header:
+            header.append("fees_usd")
+            for row in rows:
+                row.append("")
+            needs_rewrite = True
+
         if needs_rewrite:
             with open(self.csv_path, "w", newline="") as f:
                 writer = csv.writer(f)
@@ -207,6 +267,8 @@ class TradeLogger:
                 f"{record.profit_usd:.2f}",
                 reason,
                 f"{confidence:.4f}" if confidence is not None else "",
+                "maker" if record.is_maker else "taker",
+                f"{record.entry_fee_usd:.4f}",
             ])
 
     def log_settlement(self, record: TradeRecord):
@@ -265,22 +327,32 @@ class TradeLogger:
         settled_ids = {s["order_id"] for s in settlements}
         unsettled = [e for e in entries if e["order_id"] not in settled_ids]
 
-        # Compute gross P&L and fees per period
-        # Fee = taker settle fee on wins: ceil(0.07 * contracts * P * (1-P) * 100) / 100
+        # Compute gross P&L and fees per period.
+        # Uses stored fees_usd if present (from Kalshi reconcile),
+        # otherwise falls back to computed taker fee.
         import math
-        def _settle_fee(s):
-            if s["outcome"] != "win":
-                return 0.0
-            p = int(s["price_cents"]) / 100.0
-            c = int(s["contracts"])
-            return math.ceil(0.07 * c * (1 - p) * p * 100) / 100
+        def _fee(row):
+            stored = row.get("fees_usd", "")
+            if stored:
+                try:
+                    return float(stored)
+                except ValueError:
+                    pass
+            p = int(row["price_cents"]) / 100.0
+            c = int(row["contracts"])
+            return math.ceil(0.07 * c * p * (1 - p) * 100) / 100
+
+        # Map order_id -> entry row for fee/type lookup on settlements
+        entry_by_oid = {e["order_id"]: e for e in entries}
 
         daily_gross = weekly_gross = monthly_gross = alltime_gross = 0.0
         daily_fees = weekly_fees = monthly_fees = alltime_fees = 0.0
 
         for s in settlements:
             pnl = float(s["profit_usd"])
-            fee = _settle_fee(s)
+            # Prefer stored fee on settlement row, fall back to entry row
+            entry = entry_by_oid.get(s["order_id"])
+            fee = _fee(s) if s.get("fees_usd") else (_fee(entry) if entry else _fee(s))
             alltime_gross += pnl
             alltime_fees += fee
             if s["time"] >= month_ago:
@@ -300,6 +372,10 @@ class TradeLogger:
         recent = []
         for e in entries:
             s = next((s for s in settlements if s["order_id"] == e["order_id"]), None)
+            fee = _fee(e)
+            profit = round(float(s["profit_usd"]), 2) if s else 0
+            # Use stored order_type if present, else default to taker
+            order_type = e.get("order_type") or "taker"
             recent.append({
                 "time": e["time"],
                 "ticker": e["ticker"],
@@ -309,10 +385,10 @@ class TradeLogger:
                 "contracts": int(e["contracts"]),
                 "stake": round(float(e["stake_usd"]), 2),
                 "outcome": s["outcome"] if s else "pending",
-                "profit": round(float(s["profit_usd"]), 2) if s else 0,
-                "fees": 0,
-                "profit_after_fees": round(float(s["profit_usd"]), 2) if s else 0,
-                "order_type": "maker",
+                "profit": profit,
+                "fees": round(fee, 2),
+                "profit_after_fees": round(profit - fee, 2),
+                "order_type": order_type,
             })
 
         return {
@@ -542,10 +618,7 @@ class PaperExecutor:
         if self.slippage_model and self.client:
             try:
                 book = self.client.get_orderbook(ticker, depth=1)
-                yes_bids = book.get("orderbook", {}).get("yes", [])
-                no_bids = book.get("orderbook", {}).get("no", [])
-                yes_bid = yes_bids[0][0] if yes_bids else None
-                yes_ask = (100 - no_bids[0][0]) if no_bids else None
+                yes_bid, yes_ask = parse_book_top(book)
 
                 result = self.slippage_model.simulate_fill(
                     side=side,
@@ -1102,6 +1175,9 @@ class TradingBot:
         # Start fast RR scanner in its own thread (decoupled from REST I/O)
         self._start_fast_rr_thread()
 
+        # Start reconciliation thread — keeps CSV in sync with Kalshi API
+        self._start_reconcile_thread()
+
         print(f"{'='*72}")
         print("Warming up price feed (collecting 60s of data)...")
 
@@ -1255,14 +1331,16 @@ class TradingBot:
                     continue
                 buffer_pct = (feed.current_price - strike) / strike * 100
 
-                # Use per-cell optimized buffer
-                # YES side: buffer must be positive and large enough
-                if yes_mid >= cell_min_cp and buffer_pct < cell_buffer:
-                    continue
-                # NO side: buffer must be negative and large enough
+                # Determine which side we'd trade, then check buffer for that side
                 no_mid = 100 - yes_mid
-                if no_mid >= cell_min_cp and buffer_pct > -cell_buffer:
-                    continue
+                if yes_mid >= no_mid:
+                    # YES side favored — price must be ABOVE strike by buffer
+                    if buffer_pct < cell_buffer:
+                        continue
+                else:
+                    # NO side favored — price must be BELOW strike by buffer
+                    if buffer_pct > -cell_buffer:
+                        continue
 
                 # Passed all fast checks — do full evaluation and trade
                 market_dict = {
@@ -1317,6 +1395,39 @@ class TradingBot:
         t = threading.Thread(target=_rr_loop, daemon=True, name="fast-rr")
         t.start()
         self._log("[INIT] Fast RR thread started (20Hz, zero I/O)")
+
+    def _start_reconcile_thread(self):
+        """Periodically reconcile our CSV with Kalshi's API to keep data accurate."""
+        if self.config["paper_trade"]:
+            return  # No need in paper mode
+
+        try:
+            from reconcile_kalshi_api import reconcile
+        except ImportError as e:
+            self._log(f"[INIT] Reconcile module not available: {e}", level="warning")
+            return
+
+        def _reconcile_loop():
+            # Initial 30s delay to let the bot warm up
+            time.sleep(30)
+            while self.running:
+                try:
+                    stats = reconcile(self.client, verbose=False, backup=False)
+                    changes = (stats["contracts_fixed"] + stats["price_fixed"] +
+                               stats["pnl_fixed"] + stats["missing_added"])
+                    if changes > 0:
+                        self._log(
+                            f"[RECONCILE] {stats['matched']} matched, "
+                            f"{stats['pnl_fixed']} pnl fixed, "
+                            f"{stats['missing_added']} missing added"
+                        )
+                except Exception as e:
+                    self._log(f"[RECONCILE] Error: {e}", level="warning")
+                time.sleep(60)  # Run every 60 seconds
+
+        t = threading.Thread(target=_reconcile_loop, daemon=True, name="reconcile")
+        t.start()
+        self._log("[INIT] Reconcile thread started (60s interval)")
 
     def _tick(self):
         """Single iteration of the main loop."""
@@ -1688,17 +1799,28 @@ class TradingBot:
         )
         try:
             book = scanner.client.get_orderbook(ticker, depth=1)
-            yes_bids = book.get("orderbook", {}).get("yes", [])
-            no_bids = book.get("orderbook", {}).get("no", [])
-            # Orderbook prices are in cents: [[price_cents, quantity], ...]
-            # Best YES bid = highest yes bid; Best YES ask = 100 - highest no bid
-            yes_bid = yes_bids[0][0] if yes_bids else None
-            yes_ask = (100 - no_bids[0][0]) if no_bids else None
+            yes_bid, yes_ask = parse_book_top(book)
             if yes_bid is not None and yes_ask is not None:
                 self._log(f"      [BOOK] {ticker}: yes_bid={yes_bid} yes_ask={yes_ask}")
         except Exception:
             # Fall back to cached market data
             yes_bid, yes_ask = scanner.parse_yes_price(market)
+
+        # Sanity check: cross-verify book-derived ask against the market's own
+        # yes_ask field. A large divergence means the book parse is stale or
+        # malformed — skip the trade rather than act on fantasy prices.
+        # (Root cause of the 2026-04-13 bad-fill incident.)
+        # Threshold 10¢: observed normal divergence is 0-4¢ on near-the-money
+        # markets; the incident had ~80¢ divergence, so 10¢ is a wide margin.
+        if yes_bid is not None and yes_ask is not None:
+            market_bid, market_ask = scanner.parse_yes_price(market)
+            if market_ask is not None and abs(yes_ask - market_ask) > 10:
+                self._log(
+                    f"      [SANITY] {ticker}: book yes_ask={yes_ask} diverges from "
+                    f"market yes_ask={market_ask} — skipping trade",
+                    level="warning",
+                )
+                return
 
         # ── Shadow tracking: record what disabled strategies WOULD do,
         # so the matrix can evaluate them for future enablement.
@@ -1821,22 +1943,11 @@ class TradingBot:
 
             # Position sizing — different approach per strategy
             if name == "resolution_rider":
-                # Grind strategy: fractional Kelly sizing
-                # The edge: empirical win rate (~99%) is HIGHER than market price (95-97c)
-                # Kelly uses empirical win rate, not market-implied probability
-                EMPIRICAL_WIN_RATE = 0.99  # From backtest: 98-99% WR over 18K trades
-                MAX_RESOLUTION_RIDER_STAKE = 10.00  # Hard cap — one loss at 97c = $10 max
-                p = EMPIRICAL_WIN_RATE
-                q = 1 - p
+                # Fixed stake from .env, no Kelly sizing
+                MAX_RESOLUTION_RIDER_STAKE = float(os.getenv("RESOLUTION_RIDER_STAKE_USD", "10.00"))
                 price_frac = exec_price / 100.0
-                b = (1.0 - price_frac) / price_frac  # payout odds
-                if b > 0:
-                    kelly_pct = max(0, (p * b - q) / b)
-                    # Fractional Kelly (0.35) + cap at 10% of bankroll
-                    bet_frac = min(kelly_pct * 0.35, 0.10)
-                    target_stake = balance * bet_frac
-                    target_stake = min(target_stake, MAX_RESOLUTION_RIDER_STAKE)
-                    contracts = max(1, int(target_stake / price_frac))
+                if price_frac > 0:
+                    contracts = max(1, int(MAX_RESOLUTION_RIDER_STAKE / price_frac))
                     stake = contracts * price_frac
                 else:
                     contracts = 1
@@ -1860,27 +1971,34 @@ class TradingBot:
                     contracts = max(1, int(MAX_LOSS_PER_TRADE / (exec_price / 100.0)))
                     stake = contracts * (exec_price / 100.0)
 
-            # Don't trade if stake exceeds available balance
+            # If stake exceeds available balance, downsize to fit remaining cash
+            # rather than skipping entirely. Only skip if even 1 contract won't fit.
             if not self.config["paper_trade"] and stake > balance:
-                self._log(f"  [SKIP] {name}: stake ${stake:.2f} exceeds balance ${balance:.2f}")
-                continue
+                price_frac = exec_price / 100.0
+                if price_frac <= 0 or balance < price_frac:
+                    self._log(f"  [SKIP] {name}: balance ${balance:.2f} < 1 contract @ {exec_price}c")
+                    continue
+                new_contracts = int(balance / price_frac)
+                new_stake = new_contracts * price_frac
+                self._log(f"  [DOWNSIZE] {name}: ${stake:.2f} → ${new_stake:.2f} ({contracts}→{new_contracts} contracts) to fit balance ${balance:.2f}")
+                contracts = new_contracts
+                stake = new_stake
 
             # Fee-adjusted EXPECTED VALUE check
             entry_fee_fn = kalshi_maker_fee if is_maker else kalshi_taker_fee
             entry_fee = entry_fee_fn(contracts, exec_price)
-            settle_fee = kalshi_taker_fee(contracts, 100 - exec_price)  # settlement is always taker
             payout = contracts * 1.00
 
             # Resolution rider uses empirical win rate (99%) for EV, not market price
             # The edge IS the gap between price (95c) and actual win rate (99%)
             ev_prob = 0.99 if name == "resolution_rider" else calibrated_p
-            ev_win = ev_prob * (payout - stake - entry_fee - settle_fee)
+            ev_win = ev_prob * (payout - stake - entry_fee)
             ev_loss = (1 - ev_prob) * (stake + entry_fee)
             expected_value = ev_win - ev_loss
             if expected_value <= 0:
                 self._log(f"  [SKIP] {name}: negative EV after fees "
                           f"(EV=${expected_value:.2f}, raw_conf={rec.confidence:.0%}, "
-                          f"cal_p={calibrated_p:.0%}, fees=${entry_fee + settle_fee:.2f})")
+                          f"cal_p={calibrated_p:.0%}, fees=${entry_fee:.2f})")
                 continue
 
             # Execute — mark ticker BEFORE placing order to prevent re-entry
@@ -1998,16 +2116,17 @@ class TradingBot:
                                         filled = True
                                         break
                                     elif fill_count > 0:
-                                        secs_left = scanner.seconds_until_close(market)
-                                        if secs_left < 120:
-                                            contracts = fill_count
-                                            stake = contracts * (exec_price / 100.0)
-                                            entry_fee = entry_fee_fn(contracts, exec_price)
-                                            self._log(f"      [PARTIAL] Filled {fill_count}/{contracts}, keeping partial (market closing soon)")
-                                            filled = True
-                                            break
-                                        self._log(f"      [WAITING] Partial fill {fill_count}/{contracts}, {secs_left:.0f}s left...")
-                                        continue
+                                        # Accept partial fill immediately, cancel the rest
+                                        try:
+                                            self.client.cancel_order(order_id)
+                                        except Exception:
+                                            pass
+                                        contracts = fill_count
+                                        stake = contracts * (exec_price / 100.0)
+                                        entry_fee = entry_fee_fn(contracts, exec_price)
+                                        self._log(f"      [PARTIAL] Filled {fill_count} contracts, cancelled remainder")
+                                        filled = True
+                                        break
 
                                 # Also check if order left the resting state
                                 order_resp = self.client.get_orders(ticker=ticker)
@@ -2045,14 +2164,70 @@ class TradingBot:
                                 pass
 
                         if not filled:
-                            self._log(f"      [CANCEL] Order {order_id} not filled after {max_wait}s, cancelling ({order_mode})")
+                            # Check for partial fills before cancelling
+                            try:
+                                fills_resp = self.client.get_fills(order_id=order_id)
+                                fills = fills_resp.get("fills", [])
+                                fill_count = sum(f.get("count", 0) for f in fills)
+                            except Exception:
+                                fill_count = 0
+
+                            self._log(f"      [CANCEL] Order {order_id} not fully filled after {max_wait}s, cancelling ({order_mode})")
                             try:
                                 self.client.cancel_order(order_id)
                             except Exception:
                                 pass
-                            continue
+
+                            if fill_count > 0:
+                                # Keep the partial fill — we own these contracts
+                                contracts = fill_count
+                                stake = contracts * (exec_price / 100.0)
+                                entry_fee = entry_fee_fn(contracts, exec_price)
+                                self._log(f"      [PARTIAL] Keeping {fill_count} filled contracts after cancel")
+                                filled = True
+                            else:
+                                continue
 
                 self._log(f"      Order placed: {order_id}")
+
+                # Reconcile with actual fills from Kalshi —
+                # limit orders can fill at much better prices than requested,
+                # and some "taker" orders actually fill as maker ($0 fees).
+                if not self.config["paper_trade"]:
+                    try:
+                        fills_resp = self.client.get_fills(order_id=order_id)
+                        fills = fills_resp.get("fills", [])
+                        if fills:
+                            total_qty = 0
+                            total_cost = 0.0
+                            total_fees = 0.0
+                            any_taker = False
+                            for f in fills:
+                                qty = int(float(f.get("count_fp", 0) or f.get("count", 0) or 0))
+                                if side == "yes":
+                                    fill_price = float(f.get("yes_price_dollars", 0) or 0) * 100
+                                else:
+                                    fill_price = float(f.get("no_price_dollars", 0) or 0) * 100
+                                total_qty += qty
+                                total_cost += qty * fill_price
+                                total_fees += float(f.get("fee_cost", 0) or 0)
+                                if f.get("is_taker", True):
+                                    any_taker = True
+                            if total_qty > 0:
+                                avg_fill_price = total_cost / total_qty
+                                actual_price = int(round(avg_fill_price))
+                                if actual_price != exec_price:
+                                    self._log(f"      [FILL] Actual fill: {total_qty} @ {actual_price}c (requested {exec_price}c)")
+                                    exec_price = actual_price
+                                contracts = total_qty
+                                stake = contracts * (exec_price / 100.0)
+                                # Use actual fees from Kalshi instead of recomputing
+                                is_maker = not any_taker
+                                entry_fee = round(total_fees, 2)
+                                if is_maker:
+                                    self._log(f"      [FILL] Classified as MAKER (fees=${entry_fee:.2f})")
+                    except Exception as e:
+                        self._log(f"      [WARN] Fill reconciliation failed: {e}", level="warning")
 
                 # Record trade
                 record = TradeRecord(
@@ -2107,6 +2282,14 @@ class TradingBot:
         ticker = market.get("ticker", "")
         if ticker not in self.risk_mgr.open_positions:
             return
+        # Cross-path dedup: if any exit path already submitted a sell on this
+        # ticker (even if it's still resting on the book, not yet filled),
+        # don't fire another one. Prevents the 2026-04-13 repeated-sell bug
+        # where a pending limit order caused 5 sells of the same 102 contracts.
+        if not hasattr(self, '_exit_pending'):
+            self._exit_pending = set()
+        if ticker in self._exit_pending:
+            return
 
         record = self.risk_mgr.open_positions[ticker]
         secs_left = scanner.seconds_until_close(market)
@@ -2114,10 +2297,7 @@ class TradingBot:
         # Get current book prices
         try:
             book = scanner.client.get_orderbook(ticker, depth=1)
-            yes_bids = book.get("orderbook", {}).get("yes", [])
-            no_bids = book.get("orderbook", {}).get("no", [])
-            yes_bid = yes_bids[0][0] if yes_bids else None
-            yes_ask = (100 - no_bids[0][0]) if no_bids else None
+            yes_bid, yes_ask = parse_book_top(book)
         except Exception:
             yes_bid, yes_ask = scanner.parse_yes_price(market)
 
@@ -2179,6 +2359,10 @@ class TradingBot:
                 else:
                     sell_yes_price = yes_ask  # selling NO at yes_ask
 
+                # Mark as exit-pending BEFORE submitting, so concurrent exit
+                # paths can't fire a second sell while this one is in flight.
+                self._exit_pending.add(ticker)
+
                 result = self.client.place_order(
                     ticker=ticker,
                     action="sell",
@@ -2212,8 +2396,14 @@ class TradingBot:
                             dt["profit_after_fees"] = round(record.profit_after_fees, 2)
                             break
                 else:
-                    self._log(f"      [WARN] Exit order status: {order_status}")
+                    self._log(
+                        f"      [WARN] Exit order resting (status={order_status}); "
+                        f"keeping ticker in _exit_pending to block re-fire. "
+                        f"Position will reconcile on fill/settlement."
+                    )
             except Exception as e:
+                # Placement failed — clear the guard so a later tick can retry.
+                self._exit_pending.discard(ticker)
                 self._log(f"      [WARN] Exit failed: {e}", level="warning")
 
     def _force_early_exit(self, ticker: str, record, scanner, reason: str):
@@ -2225,7 +2415,13 @@ class TradingBot:
         if ticker not in self.risk_mgr.open_positions:
             return
 
-        # Prevent spamming: only attempt once per ticker
+        # Cross-path dedup shared with _check_early_exits.
+        if not hasattr(self, '_exit_pending'):
+            self._exit_pending = set()
+        if ticker in self._exit_pending:
+            return
+
+        # Legacy per-path guard (kept for belt-and-suspenders)
         if not hasattr(self, '_bayes_exit_attempted'):
             self._bayes_exit_attempted = set()
         if ticker in self._bayes_exit_attempted:
@@ -2235,10 +2431,7 @@ class TradingBot:
         # Get current book prices for the exit
         try:
             book = scanner.client.get_orderbook(ticker, depth=1)
-            yes_bids = book.get("orderbook", {}).get("yes", [])
-            no_bids = book.get("orderbook", {}).get("no", [])
-            yes_bid = yes_bids[0][0] if yes_bids else None
-            yes_ask = (100 - no_bids[0][0]) if no_bids else None
+            yes_bid, yes_ask = parse_book_top(book)
         except Exception:
             self._log(f"      [WARN] Bayesian exit: couldn't get orderbook for {ticker}")
             return
@@ -2271,6 +2464,8 @@ class TradingBot:
         else:
             try:
                 sell_yes_price = yes_bid if sell_side == "yes" else yes_ask
+                # Mark pending BEFORE submitting (cross-path dedup).
+                self._exit_pending.add(ticker)
                 result = self.client.place_order(
                     ticker=ticker,
                     action="sell",
@@ -2296,11 +2491,16 @@ class TradingBot:
                     self.perf_tracker.record(record.profit_usd, record.timestamp)
                     self._record_outcome(record)
                 else:
-                    self._log(f"      [WARN] Bayes exit order status: {order_status}")
-                    self._bayes_exit_attempted.discard(ticker)  # allow retry
+                    self._log(
+                        f"      [WARN] Bayes exit order resting (status={order_status}); "
+                        f"keeping ticker in _exit_pending to block re-fire. "
+                        f"Position will reconcile on fill/settlement."
+                    )
             except Exception as e:
-                self._log(f"      [WARN] Bayes exit failed: {e}", level="warning")
+                # Placement failed — clear both guards so a later tick can retry.
+                self._exit_pending.discard(ticker)
                 self._bayes_exit_attempted.discard(ticker)
+                self._log(f"      [WARN] Bayes exit failed: {e}", level="warning")
 
         self.bayesian.clear(ticker)
         self.exit_monitor.clear_ticker(ticker)
@@ -2469,15 +2669,15 @@ class TradingBot:
                 record.outcome = "win"
                 record.payout_usd = contracts * 1.00
                 record.profit_usd = record.payout_usd - stake_usd
-                record.settle_fee_usd = kalshi_taker_fee(contracts, 100 - record.price_cents)
+                record.settle_fee_usd = 0.0
             else:
                 record.outcome = "loss"
                 record.payout_usd = 0.0
                 record.profit_usd = -stake_usd
                 record.settle_fee_usd = 0.0
-            # Entry fee unknown from CSV — assume maker ($0) since 95% of orders are
-            record.entry_fee_usd = 0.0
-            record.profit_after_fees = record.profit_usd - record.entry_fee_usd - record.settle_fee_usd
+            # Entry fee: compute from price (taker fee on entry)
+            record.entry_fee_usd = kalshi_taker_fee(contracts, record.price_cents)
+            record.profit_after_fees = record.profit_usd - record.entry_fee_usd
 
             self.logger.log_settlement(record)
             self.perf_tracker.record(record.profit_usd, record.timestamp)
@@ -2586,17 +2786,15 @@ class TradingBot:
         balance = self._get_balance()
         is_paper = self.config["paper_trade"]
 
-        # Stats
-        completed = [t for t in self.risk_mgr.trades if t.outcome != ""]
-        pending = [t for t in self.risk_mgr.trades if t.outcome == ""]
-        wins = sum(1 for t in completed if t.outcome == "win")
-        total_pnl = round(sum(t.profit_usd for t in completed), 2)
-        total_fees = round(sum(t.entry_fee_usd + t.settle_fee_usd for t in completed), 2)
-        # Include entry fees for pending trades too
-        total_fees += round(sum(t.entry_fee_usd for t in pending), 2)
-        total_pnl_after_fees = round(sum(t.profit_after_fees for t in completed), 2)
-        # Subtract entry fees for pending trades (already paid)
-        total_pnl_after_fees -= round(sum(t.entry_fee_usd for t in pending), 2)
+        # Stats — reload from CSV periodically (every 30s)
+        # The CSV is the single source of truth, kept in sync with Kalshi by
+        # the reconcile thread. Both stats AND trade list get refreshed here.
+        if not hasattr(self, '_stats_refresh_ts') or time.time() - self._stats_refresh_ts > 30:
+            self._hist_stats = self.logger.get_historical_stats()
+            self._hist_stats["pending"] = len([t for t in self.risk_mgr.trades if t.outcome == ""])
+            # Also refresh the dashboard trade list from CSV
+            self._dashboard_trades = self._hist_stats["trades"]
+            self._stats_refresh_ts = time.time()
 
         tick_data = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2865,10 +3063,7 @@ class TradingBot:
                         self.scanner,
                     )
                     book = scanner.client.get_orderbook(t.ticker, depth=1)
-                    yes_bids = book.get("orderbook", {}).get("yes", [])
-                    no_bids = book.get("orderbook", {}).get("no", [])
-                    yes_bid = yes_bids[0][0] if yes_bids else None
-                    yes_ask = (100 - no_bids[0][0]) if no_bids else None
+                    yes_bid, yes_ask = parse_book_top(book)
 
                     if t.side == "yes" and yes_bid is not None:
                         current_value = t.contracts * (yes_bid / 100.0)
@@ -2882,19 +3077,24 @@ class TradingBot:
 
                     # In live mode, attempt to unwind the position
                     if not self.config["paper_trade"] and yes_bid is not None:
-                        sell_price = yes_bid if t.side == "yes" else yes_ask
-                        if sell_price is not None:
-                            self._log(f"      [UNWIND] Placing sell order for {t.ticker}...")
-                            try:
-                                result = self.client.place_order(
-                                    ticker=t.ticker, action="sell", side=t.side,
-                                    count=t.contracts, order_type="limit",
-                                    yes_price=sell_price,
-                                )
-                                oid = result.get("order", {}).get("order_id", "unknown")
-                                self._log(f"      [UNWIND] Sell order placed: {oid}")
-                            except Exception as e:
-                                self._log(f"      [UNWIND] FAILED to sell {t.ticker}: {e}")
+                        # Respect cross-path exit dedup: don't stack an unwind sell
+                        # on top of an already-in-flight exit order.
+                        if hasattr(self, '_exit_pending') and t.ticker in self._exit_pending:
+                            self._log(f"      [UNWIND] Skipping {t.ticker} — exit already in flight")
+                        else:
+                            sell_price = yes_bid if t.side == "yes" else yes_ask
+                            if sell_price is not None:
+                                self._log(f"      [UNWIND] Placing sell order for {t.ticker}...")
+                                try:
+                                    result = self.client.place_order(
+                                        ticker=t.ticker, action="sell", side=t.side,
+                                        count=t.contracts, order_type="limit",
+                                        yes_price=sell_price,
+                                    )
+                                    oid = result.get("order", {}).get("order_id", "unknown")
+                                    self._log(f"      [UNWIND] Sell order placed: {oid}")
+                                except Exception as e:
+                                    self._log(f"      [UNWIND] FAILED to sell {t.ticker}: {e}")
                 except Exception as e:
                     self._log(f"      [WARN] Could not fetch market data for {t.ticker}: {e}")
 
