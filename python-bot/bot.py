@@ -1410,6 +1410,7 @@ class TradingBot:
         def _reconcile_loop():
             # Initial 30s delay to let the bot warm up
             time.sleep(30)
+            last_parallel_count = 0
             while self.running:
                 try:
                     stats = reconcile(self.client, verbose=False, backup=False)
@@ -1421,6 +1422,19 @@ class TradingBot:
                             f"{stats['pnl_fixed']} pnl fixed, "
                             f"{stats['missing_added']} missing added"
                         )
+                    # Alert on new parallel-position settlements. Historical
+                    # ones (from before the reduce_only fix) are recorded but
+                    # only the delta is loud-warned — otherwise we'd spam.
+                    parallel = stats.get("parallel_positions", 0)
+                    if parallel > last_parallel_count:
+                        new = parallel - last_parallel_count
+                        self._log(
+                            f"[RECONCILE] WARN: {new} new settlement(s) with parallel "
+                            f"YES+NO positions detected — exit path may have skipped "
+                            f"reduce_only. Total affected: {parallel}",
+                            level="warning",
+                        )
+                    last_parallel_count = parallel
                 except Exception as e:
                     self._log(f"[RECONCILE] Error: {e}", level="warning")
                 time.sleep(60)  # Run every 60 seconds

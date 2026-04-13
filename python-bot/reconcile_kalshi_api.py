@@ -80,6 +80,48 @@ def fetch_all_settlements(client: KalshiClient) -> dict:
     return by_ticker
 
 
+def audit_parallel_positions(settlements_by_ticker: dict) -> list:
+    """
+    Find settlements where the bot held BOTH yes_count_fp > 0 AND
+    no_count_fp > 0. This should never happen with a correctly-closing
+    exit path. When it does, it means the exit placed a sell without
+    reduce_only=true, opening a parallel offsetting position instead
+    of closing the long. (Root cause of the 2026-04-13 XRP15M incident.)
+
+    Returns a list of dicts with {ticker, yes_count, no_count, yes_cost,
+    no_cost, net_loss, settled_time}.
+    """
+    found = []
+    for ticker, s in settlements_by_ticker.items():
+        try:
+            yc = float(s.get("yes_count_fp", 0) or 0)
+            nc = float(s.get("no_count_fp", 0) or 0)
+        except (ValueError, TypeError):
+            continue
+        if yc > 0 and nc > 0:
+            yes_cost = float(s.get("yes_total_cost_dollars", 0) or 0)
+            no_cost = float(s.get("no_total_cost_dollars", 0) or 0)
+            market_result = s.get("market_result", "")
+            # Settlement arithmetic: the winning side pays $1/contract.
+            if market_result == "yes":
+                realized = (yc * 1.0 - yes_cost) + (0 - no_cost)
+            elif market_result == "no":
+                realized = (0 - yes_cost) + (nc * 1.0 - no_cost)
+            else:
+                realized = -(yes_cost + no_cost)
+            found.append({
+                "ticker": ticker,
+                "yes_count": int(yc),
+                "no_count": int(nc),
+                "yes_cost": yes_cost,
+                "no_cost": no_cost,
+                "market_result": market_result,
+                "realized_pnl": round(realized, 2),
+                "settled_time": s.get("settled_time", ""),
+            })
+    return found
+
+
 def aggregate_fills(fills: list) -> dict:
     """Aggregate multiple fills for one order into totals."""
     total_qty = 0
@@ -144,11 +186,26 @@ def reconcile(client: KalshiClient, verbose: bool = True, backup: bool = True) -
     all_oids = set(entries_by_oid.keys()) | set(settlements_by_oid.keys())
     log(f"  {len(all_oids)} unique orders in our CSV")
 
+    # Audit for parallel-position settlements. If the reduce_only fix is
+    # working, new settlements should never have both yes_count_fp > 0 and
+    # no_count_fp > 0. Historical settlements from before the fix will
+    # still trip this check; that's expected and useful — the user can
+    # see which prior positions were affected.
+    parallel_positions = audit_parallel_positions(settlements_by_ticker)
+    if parallel_positions:
+        log(f"\n[AUDIT] {len(parallel_positions)} settlements with parallel YES+NO positions "
+            f"(check reduce_only on exit paths):")
+        for p in parallel_positions[-10:]:  # show most recent 10
+            log(f"  {p['ticker']}: yes={p['yes_count']}@${p['yes_cost']:.2f} "
+                f"no={p['no_count']}@${p['no_cost']:.2f} "
+                f"result={p['market_result']} realized=${p['realized_pnl']:+.2f}")
+
     log("\n[3/4] Reconciling...")
     stats = {
         "matched": 0, "price_fixed": 0, "contracts_fixed": 0,
         "pnl_fixed": 0, "unmatched": 0, "no_settlement": 0,
         "missing_added": 0,
+        "parallel_positions": len(parallel_positions),
     }
 
     for oid in all_oids:
