@@ -250,6 +250,7 @@ class KalshiClient:
         client_order_id: str = None,
         expiration_ts: int = None,
         reduce_only: bool = False,
+        time_in_force: str = None,
     ) -> dict:
         """
         Place an order on a market.
@@ -266,10 +267,18 @@ class KalshiClient:
             reduce_only: If True, the order can ONLY reduce an existing
                 position (never open a new one). Required on exit/sell
                 orders — without it, Kalshi creates a new offsetting
-                position instead of closing the existing long.
+                position instead of closing the existing long. Note that
+                reduce_only orders MUST use time_in_force="immediate_or_cancel".
+            time_in_force: Order duration. One of "fill_or_kill",
+                "good_till_canceled", or "immediate_or_cancel". Required
+                to be "immediate_or_cancel" when reduce_only is True.
         """
         if client_order_id is None:
             client_order_id = str(uuid.uuid4())
+
+        # Kalshi requires IoC time-in-force when using reduce_only.
+        if reduce_only and time_in_force is None:
+            time_in_force = "immediate_or_cancel"
 
         order_data = {
             "ticker": ticker,
@@ -285,6 +294,8 @@ class KalshiClient:
             order_data["expiration_ts"] = expiration_ts
         if reduce_only:
             order_data["reduce_only"] = True
+        if time_in_force is not None:
+            order_data["time_in_force"] = time_in_force
 
         return self._request("POST", "/portfolio/orders", data=order_data)
 

@@ -2449,6 +2449,15 @@ class TradingBot:
                             dt["profit"] = round(record.profit_usd, 2)
                             dt["profit_after_fees"] = round(record.profit_after_fees, 2)
                             break
+                elif order_status == "canceled":
+                    # IoC + reduce_only: order was cancelled because nothing
+                    # filled (price moved, or no match). Clear the guard so
+                    # the next tick can retry at a fresh price.
+                    self._exit_pending.discard(ticker)
+                    self._log(
+                        f"      [WARN] Exit canceled (IoC unfilled at {sell_yes_price}c); "
+                        f"will retry next tick."
+                    )
                 else:
                     self._log(
                         f"      [WARN] Exit order resting (status={order_status}); "
@@ -2546,6 +2555,14 @@ class TradingBot:
                     self.logger.log_settlement(record)
                     self.perf_tracker.record(record.profit_usd, record.timestamp)
                     self._record_outcome(record)
+                elif order_status == "canceled":
+                    # IoC + reduce_only: cancelled unfilled. Allow retry.
+                    self._exit_pending.discard(ticker)
+                    self._bayes_exit_attempted.discard(ticker)
+                    self._log(
+                        f"      [WARN] Bayes exit canceled (IoC unfilled at {sell_yes_price}c); "
+                        f"will retry next tick."
+                    )
                 else:
                     self._log(
                         f"      [WARN] Bayes exit order resting (status={order_status}); "
