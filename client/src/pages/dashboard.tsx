@@ -20,9 +20,7 @@ import {
   BarChart3,
   Zap,
   Target,
-  GitMerge,
   Timer,
-  Trophy,
   AlertTriangle,
   Wallet,
   DollarSign,
@@ -470,53 +468,6 @@ const CHART_TABS = [
   { key: "sol" as const, label: "SOL", color: "#9945ff" },
 ];
 
-function AssetToggle({
-  asset,
-  enabled,
-  color,
-  label,
-}: {
-  asset: string;
-  enabled: boolean;
-  color: string;
-  label: string;
-}) {
-  const toggle = useCallback(async () => {
-    try {
-      await fetch(`${API_BASE}/api/toggle-asset`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ asset, enabled: !enabled }),
-      });
-    } catch (e) {
-      console.error("Toggle failed", e);
-    }
-  }, [asset, enabled]);
-
-  return (
-    <button
-      onClick={toggle}
-      className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider font-medium transition-colors"
-      style={{ color: enabled ? color : "#475569" }}
-      title={`${enabled ? "Disable" : "Enable"} ${label} trading`}
-    >
-      <div
-        className="w-6 h-3.5 rounded-full relative transition-colors"
-        style={{ backgroundColor: enabled ? `${color}33` : "hsl(220, 20%, 12%)" }}
-      >
-        <div
-          className="absolute top-0.5 w-2.5 h-2.5 rounded-full transition-all"
-          style={{
-            backgroundColor: enabled ? color : "#475569",
-            left: enabled ? "12px" : "2px",
-          }}
-        />
-      </div>
-      {label}
-    </button>
-  );
-}
-
 function TabbedChart({ data }: { data: TickData }) {
   const [active, setActive] = useState<"btc" | "eth" | "sol">("btc");
 
@@ -549,17 +500,6 @@ function TabbedChart({ data }: { data: TickData }) {
             >
               {tab.label}
             </button>
-          ))}
-        </div>
-        <div className="flex items-center gap-3 ml-auto">
-          {CHART_TABS.map((tab) => (
-            <AssetToggle
-              key={tab.key}
-              asset={tab.key}
-              enabled={data.enabled_assets[tab.key]}
-              color={tab.color}
-              label={tab.label}
-            />
           ))}
         </div>
       </div>
@@ -767,11 +707,7 @@ function StrategySignalsPanel({ data }: { data: TickData }) {
   const strategies = data.strategies_by_asset[active];
 
   const items = [
-    { name: "Momentum", icon: Zap, ...strategies.momentum },
-    { name: "Mean Reversion", icon: GitMerge, ...strategies.mean_reversion },
-    { name: "Consensus (4 signals)", icon: Target, ...strategies.consensus },
     { name: "Resolution Rider", icon: Timer, ...strategies.resolution_rider },
-    { name: "Favorite Bias", icon: Trophy, ...strategies.favorite_bias },
   ];
 
   return (
@@ -879,6 +815,9 @@ function RRConfigPanel({ config }: { config: NonNullable<TickData["rr_config"]> 
                 <th className="text-center py-1.5 px-2 font-medium">Price</th>
                 <th className="text-center py-1.5 px-2 font-medium">Max Secs</th>
                 <th className="text-center py-1.5 px-2 font-medium">Buffer</th>
+                <th className="text-center py-1.5 px-2 font-medium">Mom Gate</th>
+                <th className="text-center py-1.5 px-2 font-medium">Mom Win</th>
+                <th className="text-center py-1.5 px-2 font-medium">Vol Gate</th>
                 <th className="text-center py-1.5 px-2 font-medium">CV WR</th>
                 <th className="text-center py-1.5 px-2 font-medium">CV Trades</th>
               </tr>
@@ -890,6 +829,17 @@ function RRConfigPanel({ config }: { config: NonNullable<TickData["rr_config"]> 
                   <td className="text-center py-1.5 px-2 text-slate-200">{cell.price}</td>
                   <td className="text-center py-1.5 px-2 text-slate-200">{cell.max_secs}s</td>
                   <td className="text-center py-1.5 px-2 text-slate-200">{cell.buffer}</td>
+                  <td className="text-center py-1.5 px-2 text-slate-200 tabular-nums">
+                    {cell.mom_gate != null ? `${cell.mom_gate.toFixed(3)}%` : "—"}
+                  </td>
+                  <td className="text-center py-1.5 px-2 text-slate-400 tabular-nums">
+                    {cell.mom_window != null && cell.mom_periods != null
+                      ? `${cell.mom_window}s×${cell.mom_periods}`
+                      : "—"}
+                  </td>
+                  <td className="text-center py-1.5 px-2 text-slate-200 tabular-nums">
+                    {cell.vol_gate != null ? `≤${cell.vol_gate.toFixed(3)}%` : "off"}
+                  </td>
                   <td className="text-center py-1.5 px-2">
                     <span className={cell.cv_wr === 1 ? "text-emerald-400" : "text-amber-400"}>
                       {cell.cv_wr !== null ? `${(cell.cv_wr * 100).toFixed(0)}%` : "—"}
@@ -902,6 +852,107 @@ function RRConfigPanel({ config }: { config: NonNullable<TickData["rr_config"]> 
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Live Momentum Monitor ──────────────────────────────────────
+// Shows the exact live spot price + momentum the bot uses for RR
+// entry gating on every tradeable coin. This is the number to
+// watch during losses: if mom_cell is outside the cell's mom_gate
+// at entry time, the trade should never have fired.
+function MomentumPanel({ momentum }: { momentum: Record<string, any> | undefined }) {
+  if (!momentum || Object.keys(momentum).length === 0) return null;
+  const rows = Object.entries(momentum).sort(([a], [b]) => a.localeCompare(b));
+  return (
+    <div className="bg-[hsl(222,33%,7%)] rounded-lg p-4 border border-[hsl(220,20%,12%)]">
+      <h2 className="text-sm font-semibold text-slate-300 mb-3 uppercase tracking-wider">
+        Live Momentum
+        <span className="text-slate-600 font-normal ml-2">
+          (per-coin spot + smoothed momentum, matches RR cell window/periods)
+        </span>
+      </h2>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-slate-500 uppercase tracking-wider border-b border-[hsl(220,20%,12%)]">
+              <th className="text-left py-1.5 pr-3 font-medium">Coin</th>
+              <th className="text-right py-1.5 px-2 font-medium">Price</th>
+              <th className="text-right py-1.5 px-2 font-medium">1m</th>
+              <th className="text-right py-1.5 px-2 font-medium">5m</th>
+              <th className="text-right py-1.5 px-2 font-medium">Cell Mom</th>
+              <th className="text-right py-1.5 px-2 font-medium">Window</th>
+              <th className="text-right py-1.5 px-2 font-medium">Mom Gate</th>
+              <th className="text-right py-1.5 px-2 font-medium">Vol</th>
+              <th className="text-right py-1.5 px-2 font-medium">Vol Gate</th>
+              <th className="text-center py-1.5 px-2 font-medium">OK?</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(([coin, m]) => {
+              const momCell: number | null = m.mom_cell ?? null;
+              const gate: number | null = m.mom_gate ?? null;
+              const vol: number | null = m.realized_vol ?? null;
+              const volGate: number | null = m.vol_gate ?? null;
+              // OK = momentum within gate AND vol within gate. Either
+              // null (unknown) means we can't judge — show "—".
+              const momPasses = momCell != null && gate != null ? momCell >= gate : null;
+              const volPasses = vol != null && volGate != null ? vol <= volGate
+                : (volGate == null ? true : null);
+              let status: "ok" | "blocked" | "unknown" = "unknown";
+              if (momPasses != null && volPasses != null) {
+                status = (momPasses && volPasses) ? "ok" : "blocked";
+              }
+              const momColor = momCell == null
+                ? "text-slate-500"
+                : momCell > 0
+                  ? "text-emerald-400"
+                  : momCell < 0
+                    ? "text-red-400"
+                    : "text-slate-300";
+              const volColor = vol == null
+                ? "text-slate-500"
+                : (volGate != null && vol > volGate)
+                  ? "text-red-400"
+                  : "text-slate-200";
+              return (
+                <tr key={coin} className="border-b border-[hsl(220,20%,8%)]">
+                  <td className="py-1.5 pr-3 text-slate-300 font-mono uppercase">{coin}</td>
+                  <td className="text-right py-1.5 px-2 text-slate-200 tabular-nums">
+                    {m.price ? m.price.toLocaleString(undefined, { maximumFractionDigits: 4 }) : "—"}
+                  </td>
+                  <td className={`text-right py-1.5 px-2 tabular-nums ${m.mom_1m > 0 ? "text-emerald-400" : m.mom_1m < 0 ? "text-red-400" : "text-slate-500"}`}>
+                    {m.mom_1m ? `${m.mom_1m.toFixed(3)}%` : "—"}
+                  </td>
+                  <td className={`text-right py-1.5 px-2 tabular-nums ${m.mom_5m > 0 ? "text-emerald-400" : m.mom_5m < 0 ? "text-red-400" : "text-slate-500"}`}>
+                    {m.mom_5m ? `${m.mom_5m.toFixed(3)}%` : "—"}
+                  </td>
+                  <td className={`text-right py-1.5 px-2 tabular-nums ${momColor}`}>
+                    {momCell != null ? `${momCell.toFixed(3)}%` : "—"}
+                  </td>
+                  <td className="text-right py-1.5 px-2 text-slate-400 tabular-nums">
+                    {m.mom_window}s×{m.mom_periods}
+                  </td>
+                  <td className="text-right py-1.5 px-2 text-slate-400 tabular-nums">
+                    {gate != null ? `${gate.toFixed(3)}%` : "—"}
+                  </td>
+                  <td className={`text-right py-1.5 px-2 tabular-nums ${volColor}`}>
+                    {vol != null ? `${vol.toFixed(3)}%` : "—"}
+                  </td>
+                  <td className="text-right py-1.5 px-2 text-slate-400 tabular-nums">
+                    {volGate != null ? `≤${volGate.toFixed(3)}%` : "off"}
+                  </td>
+                  <td className="text-center py-1.5 px-2">
+                    {status === "ok" && <span className="text-emerald-400">✓</span>}
+                    {status === "blocked" && <span className="text-red-400">✗</span>}
+                    {status === "unknown" && <span className="text-slate-600">—</span>}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -1387,6 +1438,9 @@ export default function Dashboard() {
               <CurrentMarketPanel data={data} />
               <StrategySignalsPanel data={data} />
             </div>
+
+            {/* Live Momentum Monitor — per-coin, matches RR gating */}
+            <MomentumPanel momentum={data.asset_momentum} />
 
             {/* Resolution Rider Config */}
             {data.rr_config && <RRConfigPanel config={data.rr_config} />}

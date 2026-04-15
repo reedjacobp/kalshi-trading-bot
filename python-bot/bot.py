@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from pathlib import Path
+from typing import Optional
 
 import requests as _requests
 from dotenv import load_dotenv
@@ -48,23 +49,9 @@ from market_scanner import MarketScanner
 from rti_feed import RTIFeed
 from strategy_matrix import StrategyMatrix
 from risk_manager import RiskConfig, RiskManager, TradeRecord, kalshi_taker_fee, kalshi_maker_fee
-from strategies import (
-    ConsensusStrategy,
-    FavoriteBiasStrategy,
-    MeanReversionStrategy,
-    MomentumStrategy,
-    ResolutionRiderStrategy,
-    Signal,
-)
-from strategies.early_exit import EarlyExitMonitor
+from strategies import ResolutionRiderStrategy, Signal
 from multi_feed import MultiExchangeFeed
-from vol_regime import VolRegimeDetector
-from bayesian_updater import BayesianUpdater
-from kl_divergence import KLDivergenceSignal
-from calibrator import ConfidenceCalibrator
 from performance import PerformanceTracker
-from broad_scanner import BroadScanner
-from strategy_tracker import StrategyTracker
 
 
 # ─── Orderbook parsing ───────────────────────────────────────────────────────
@@ -132,11 +119,11 @@ def load_config():
         "private_key_path": os.getenv("KALSHI_PRIVATE_KEY_PATH", ""),
         "env": os.getenv("KALSHI_ENV", "demo"),
         "series": args.series or os.getenv("MARKET_SERIES", "KXBTC15M"),
-        "stake_usd": args.stake or float(os.getenv("STAKE_USD", "5.00")),
+        "stake_usd": args.stake or float(os.getenv("STAKE_USD", "10.00")),
         "max_daily_loss": float(os.getenv("MAX_DAILY_LOSS_USD", "25.00")),
         "max_concurrent": int(os.getenv("MAX_CONCURRENT_POSITIONS", "3")),
         "poll_interval": 0,  # Legacy — bot runs at full speed via WebSocket
-        "strategy": args.strategy or os.getenv("STRATEGY", "consensus"),
+        "strategy": args.strategy or os.getenv("STRATEGY", "resolution_rider"),
         "paper_trade": not args.live and os.getenv("PAPER_TRADE", "true").lower() == "true",
     }
 
@@ -249,27 +236,76 @@ class TradeLogger:
                 for row in rows:
                     writer.writerow(row)
 
+    def _row_for(self, record: TradeRecord, reason: str, confidence: Optional[float]) -> list:
+        return [
+            datetime.fromtimestamp(record.timestamp, tz=timezone.utc).isoformat(),
+            self.run_id,
+            record.strategy,
+            record.ticker,
+            record.side,
+            record.price_cents,
+            record.contracts,
+            f"{record.stake_usd:.2f}",
+            record.order_id,
+            record.outcome,
+            f"{record.payout_usd:.2f}",
+            f"{record.profit_usd:.2f}",
+            reason,
+            f"{confidence:.4f}" if confidence is not None else "",
+            "maker" if record.is_maker else "taker",
+            f"{record.entry_fee_usd:.4f}",
+        ]
+
     def log_trade(self, record: TradeRecord, reason: str = "", confidence: float = None):
         with open(self.csv_path, "a", newline="") as f:
+            csv.writer(f).writerow(self._row_for(record, reason, confidence))
+
+    def upsert_entry(self, record: TradeRecord, reason: str = "", confidence: float = None):
+        """Write or update a NON-settlement row for `record.order_id`.
+
+        Exists to close the reconcile race: right after the bot places an
+        order and receives an `order_id`, we immediately upsert a pending
+        row so the reconcile thread finds the oid in `all_oids` and won't
+        write a competing `kalshi_api_import` row. As the fill-wait loop
+        learns more (partial fill, full fill, cancellation), it calls this
+        again to rewrite the same row in place with the final shape.
+        """
+        if not record.order_id:
+            return self.log_trade(record, reason=reason, confidence=confidence)
+        new_row = self._row_for(record, reason, confidence)
+        if not self.csv_path.exists():
+            return self.log_trade(record, reason=reason, confidence=confidence)
+        with open(self.csv_path, "r", newline="") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+        if not rows:
+            return self.log_trade(record, reason=reason, confidence=confidence)
+        header = rows[0]
+        try:
+            oid_idx = header.index("order_id")
+            reason_idx = header.index("reason")
+        except ValueError:
+            return self.log_trade(record, reason=reason, confidence=confidence)
+        # Match the LAST non-settlement row with this oid so partial-fill
+        # updates land on the entry row rather than overwriting a settlement.
+        target = None
+        for i in range(len(rows) - 1, 0, -1):
+            r = rows[i]
+            if len(r) <= oid_idx:
+                continue
+            if r[oid_idx] != record.order_id:
+                continue
+            if r[reason_idx].startswith("SETTLED:"):
+                continue
+            target = i
+            break
+        if target is None:
+            self.log_trade(record, reason=reason, confidence=confidence)
+            return
+        rows[target] = new_row
+        with open(self.csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                datetime.fromtimestamp(record.timestamp, tz=timezone.utc).isoformat(),
-                self.run_id,
-                record.strategy,
-                record.ticker,
-                record.side,
-                record.price_cents,
-                record.contracts,
-                f"{record.stake_usd:.2f}",
-                record.order_id,
-                record.outcome,
-                f"{record.payout_usd:.2f}",
-                f"{record.profit_usd:.2f}",
-                reason,
-                f"{confidence:.4f}" if confidence is not None else "",
-                "maker" if record.is_maker else "taker",
-                f"{record.entry_fee_usd:.4f}",
-            ])
+            writer.writerows(rows)
 
     def log_settlement(self, record: TradeRecord):
         """Update the CSV with settlement info (appends a settlement row)."""
@@ -451,14 +487,18 @@ def fetch_ofi() -> float:
 # ─── SSE Server ─────────────────────────────────────────────────────────────
 
 class _SSEState:
-    """Shared mutable state between the bot loop and SSE server."""
+    """Shared mutable state between the bot loop and SSE server.
+
+    The only runtime control surface is `trading_enabled` — a global
+    pause. Per-asset toggles were removed because RR is already scoped
+    to safe cells by the optimizer, and partial toggles caused the bot
+    to keep collecting data while silently ignoring half the markets.
+    """
     tick_data: str = ""  # JSON string of the latest TickData
-    enabled_assets: dict = None  # {"btc": True, "eth": True, "sol": True}
     trading_enabled: bool = True  # Global trading on/off switch
     lock = threading.Lock()
 
     def __init__(self):
-        self.enabled_assets = {"btc": True, "eth": True, "sol": True}
         self.trading_enabled = True
 
 
@@ -480,16 +520,7 @@ class SSEHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(content_length)) if content_length else {}
 
-        if self.path == "/api/toggle-asset":
-            asset = body.get("asset", "").lower()
-            enabled = body.get("enabled")
-            if asset in ("btc", "eth", "sol") and isinstance(enabled, bool):
-                with _sse_state.lock:
-                    _sse_state.enabled_assets[asset] = enabled
-                self._json_response(200, {"ok": True, "enabled_assets": _sse_state.enabled_assets})
-            else:
-                self._json_response(400, {"error": "invalid asset or enabled value"})
-        elif self.path == "/api/toggle-trading":
+        if self.path == "/api/toggle-trading":
             enabled = body.get("enabled")
             if isinstance(enabled, bool):
                 with _sse_state.lock:
@@ -741,7 +772,6 @@ class TradingBot:
         # Use RTIFeed (CF Benchmarks RTI approximation) instead of single-exchange
         # PriceFeed — aggregates Coinbase, Kraken, Bitstamp, Gemini, Binance
         # with volume weighting and outlier filtering to match Kalshi's settlement index
-        daily_stake = float(os.getenv("DAILY_STAKE_USD", "15.00"))
         self.assets = {
             # ── 15-minute markets ──
             "btc": {
@@ -788,16 +818,16 @@ class TradingBot:
                 "price_feed": RTIFeed(symbol="HYPE-USD", window_seconds=1200),
             },
         }
-        # ── Daily markets (stronger edge, higher stake) ──
-        # Walk-forward backtest: 12/12 months profitable, 89% WR, Sharpe 0.28
-        # Share price feeds with 15M counterparts to avoid duplicate API calls
+        # ── Daily markets (share price feeds with 15M counterparts) ──
+        # RR uses a single flat stake (STAKE_USD) for both 15M and daily
+        # cells; per-asset sizing is expressed through cell params, not
+        # through a separate daily-stake override.
         self.assets.update({
             "btc_daily": {
                 "series": "KXBTCD",
                 "symbol": "BTC-USD",
                 "scanner": MarketScanner(self.client, series="KXBTCD"),
                 "price_feed": self.assets["btc"]["price_feed"],
-                "stake_override": daily_stake,
                 "is_daily": True,
             },
             "eth_daily": {
@@ -805,7 +835,6 @@ class TradingBot:
                 "symbol": "ETH-USD",
                 "scanner": MarketScanner(self.client, series="KXETHD"),
                 "price_feed": self.assets["eth"]["price_feed"],
-                "stake_override": daily_stake,
                 "is_daily": True,
             },
             "sol_daily": {
@@ -813,7 +842,6 @@ class TradingBot:
                 "symbol": "SOL-USD",
                 "scanner": MarketScanner(self.client, series="KXSOLD"),
                 "price_feed": self.assets["sol"]["price_feed"],
-                "stake_override": daily_stake,
                 "is_daily": True,
             },
             "doge_daily": {
@@ -821,7 +849,6 @@ class TradingBot:
                 "symbol": "DOGE-USD",
                 "scanner": MarketScanner(self.client, series="KXDOGED"),
                 "price_feed": self.assets["doge"]["price_feed"],
-                "stake_override": daily_stake,
                 "is_daily": True,
             },
             "xrp_daily": {
@@ -829,7 +856,6 @@ class TradingBot:
                 "symbol": "XRP-USD",
                 "scanner": MarketScanner(self.client, series="KXXRPD"),
                 "price_feed": self.assets["xrp"]["price_feed"],
-                "stake_override": daily_stake,
                 "is_daily": True,
             },
             "bnb_daily": {
@@ -837,7 +863,6 @@ class TradingBot:
                 "symbol": "BNB-USD",
                 "scanner": MarketScanner(self.client, series="KXBNBD"),
                 "price_feed": self.assets["bnb"]["price_feed"],
-                "stake_override": daily_stake,
                 "is_daily": True,
             },
             "hype_daily": {
@@ -845,7 +870,6 @@ class TradingBot:
                 "symbol": "HYPE-USD",
                 "scanner": MarketScanner(self.client, series="KXHYPED"),
                 "price_feed": self.assets["hype"]["price_feed"],
-                "stake_override": daily_stake,
                 "is_daily": True,
             },
         })
@@ -876,29 +900,10 @@ class TradingBot:
         # Strategies
         self.strategies = self._init_strategies(config["strategy"])
 
-        # Early exit monitor for open positions.
-        # Disabled 2026-04-13: RR thesis is 98% WR hold-to-settlement; stop
-        # losses were firing on normal adverse moves and then the market was
-        # recovering before settlement, turning would-be wins into -$13 to
-        # -$17 whipsaw losses. Observed 4 such trades on 2026-04-13 totaling
-        # ~$60 of unnecessary losses.
-        # The monitor instance is still constructed so the rest of the
-        # codebase doesn't break, but _check_early_exits and _force_early_exit
-        # are gated by self._early_exits_enabled below.
-        self._early_exits_enabled = False
-        self.exit_monitor = EarlyExitMonitor(
-            stop_loss_cents=15,
-            take_profit_cents=10,
-        )
-
-        # Volatility regime detector
-        self.vol_detector = VolRegimeDetector()
-        self._current_regime = None
-        self._regime_params = None
-
-        # Bayesian probability updater — dynamically adjusts confidence
-        # as new price evidence arrives during each 15-min window
-        self.bayesian = BayesianUpdater()
+        # RR is hold-to-settlement: no early exits, no mid-trade Bayesian
+        # collapse, no vol-regime gating of strategies that no longer exist.
+        # Live results confirmed exits whipsawed normal adverse moves into
+        # unnecessary losses (~$60 on 2026-04-13).
 
         # WebSocket feed for real-time Kalshi contract prices
         self.ws_feed = KalshiWebSocket(
@@ -920,80 +925,45 @@ class TradingBot:
         for asset in self.assets.values():
             asset["scanner"].ws_feed = self.ws_feed
 
-        # Broad market scanner — scans ALL Kalshi markets for resolution_rider
-        # opportunities (95-99c contracts), not just crypto series.
-        # Broad scanner disabled — non-crypto markets lack price feeds for
-        # the mandatory buffer check. Can re-enable when we add price feeds.
-        self.broad_scanner = None
-
-        # KL-divergence cross-asset signal — detects mispricings between
-        # BTC/ETH/SOL contract prices based on their correlation
-        self.kl_signal = KLDivergenceSignal()
-
         # Logger
         csv_name = "paper_trades.csv" if config["paper_trade"] else "live_trades.csv"
         self.logger = TradeLogger(f"data/{csv_name}", run_id=self.run_id)
-
-        # Confidence calibrator — maps raw strategy confidence to empirical
-        # win probabilities using historical trade data
-        self.calibrator = ConfidenceCalibrator(
-            csv_paths=["data/paper_trades.csv", "data/live_trades.csv"],
-        )
-        cal_stats = self.calibrator.get_strategy_stats()
-        if cal_stats:
-            self._log(f"[INIT] Calibrator loaded: {', '.join(f'{s}={d['total_trades']}t' for s, d in cal_stats.items())}")
-        else:
-            self._log("[INIT] Calibrator: no historical data, using cold-start dampening")
 
         # Performance tracker — computes Sharpe, drawdown, profit factor
         paper_balance = float(os.getenv("PAPER_BALANCE", "100.00")) if config["paper_trade"] else 0.0
         self.perf_tracker = PerformanceTracker(initial_balance=paper_balance)
 
-        # Per-strategy tracker — auto-suspends underperforming strategies
-        self.strategy_tracker = StrategyTracker()
-
-        # Adaptive strategy matrix — auto-disables (asset, strategy) combos
-        # that underperform, shadow-tracks disabled combos, re-enables on recovery
-        self.strategy_matrix = StrategyMatrix(
-            window_size=20,
-            disable_threshold=-0.05,       # Tightened from -10%: cut losers faster
-            first_enable_threshold=0.05,   # Raised from 1%: need real edge, not noise
-            enable_threshold=0.05,         # Raised from 2%: must prove recovery
-            extended_disable_threshold=0.10,  # Raised from 5%: repeat offenders need strong proof
-            first_enable_min_trades=10,    # Raised from 3: need statistically meaningful sample
-            min_trades_to_judge=3,         # Lowered from 5: disable faster on bad edge
-            cooldown_seconds=900,          # Raised from 300: one full 15M market cycle
-            persist_path="data/strategy_matrix_state.json",
-            strategy_overrides={
-                # Consensus has been a consistent money loser (-$69 over 73 trades,
-                # 33% WR at 47c avg entry). Make it very hard to enable and quick
-                # to disable. It must prove itself over a large shadow sample.
-                "consensus": {
-                    "first_enable_min_trades": 30,   # Need 30 shadow trades (vs 10 default)
-                    "first_enable_threshold": 0.15,  # 15% shadow edge (vs 5% default)
-                    "enable_threshold": 0.15,        # 15% shadow edge to re-enable (vs 5%)
-                    "extended_disable_threshold": 0.20,  # 20% if repeatedly disabled
-                    "min_trades_to_judge": 3,        # Same as default — disable fast
-                    "disable_threshold": -0.03,      # Trigger at -3% edge (vs -5% default)
-                },
-            },
-        )
-        # Pre-populate all cells so dashboard shows the full matrix at startup
+        # Adaptive strategy matrix — auto-disables (asset, RR) cells that
+        # underperform, shadow-tracks disabled cells, re-enables on recovery.
+        # The whitelists guarantee the matrix can never accumulate stale
+        # cells from deleted strategies, broad-scan tickers, or "unknown"
+        # asset keys — anything outside the lists is silently dropped.
         active_assets = list(self.assets.keys())
         active_strategies = list(self.strategies.keys())
+        self.strategy_matrix = StrategyMatrix(
+            window_size=20,
+            disable_threshold=-0.05,
+            first_enable_threshold=0.05,
+            enable_threshold=0.05,
+            extended_disable_threshold=0.10,
+            first_enable_min_trades=10,
+            min_trades_to_judge=3,
+            cooldown_seconds=900,
+            persist_path="data/strategy_matrix_state.json",
+            allowed_assets=active_assets,
+            allowed_strategies=active_strategies,
+        )
+        # Pre-populate all cells so dashboard shows the full matrix at startup
         self.strategy_matrix.initialize_cells(active_assets, active_strategies)
 
-        # Pre-enable strategies with strong walk-forward evidence.
-        # These don't need to prove themselves in shadow mode — they have
-        # 12 months of out-of-sample data (11K+ trades for favorite_bias,
-        # Load optimized per-cell RR params from Monte Carlo optimizer
+        # Load optimized per-cell RR params from Monte Carlo optimizer.
+        # Each cell (e.g. "xrp_15m") has its own max_seconds, buffer, momentum
+        # gate, etc. Only cells that are cross-validation-profitable are kept.
         self._rr_cell_params = {}
         rr_params_path = Path("data/rr_params.json")
         if rr_params_path.exists():
             with open(rr_params_path) as f:
                 all_rr_params = json.load(f)
-            # Enable cells that were profitable in cross-validation
-            # (or have no CV data but profitable training)
             safe_cells = {k: v for k, v in all_rr_params.items()
                           if v.get("cv_val_profit", 0) > 0 or
                           (v.get("cv_folds", 0) == 0 and v.get("training_profit", 0) > 0)}
@@ -1006,7 +976,6 @@ class TradingBot:
 
         # Enable safe RR cells, disable unsafe ones
         for asset in active_assets:
-            # Map asset key to cell name: btc -> btc_15m, btc_daily -> btc_hourly
             if asset.endswith("_daily"):
                 cell = asset.replace("_daily", "_hourly")
             else:
@@ -1016,11 +985,6 @@ class TradingBot:
                 self.strategy_matrix.force_enable(asset, "resolution_rider", clear_history=True)
             else:
                 self.strategy_matrix.force_disable(asset, "resolution_rider", hard=True)
-
-        # Hard-disable non-RR strategies
-        for asset in active_assets:
-            self.strategy_matrix.force_disable(asset, "consensus", hard=True)
-            self.strategy_matrix.force_disable(asset, "favorite_bias", hard=True)
 
         # Track which markets we've already traded on
         self._traded_tickers: set = set()
@@ -1065,28 +1029,11 @@ class TradingBot:
             return 0.0
 
     def _init_strategies(self, strategy_name: str) -> dict:
-        """Initialize the selected strategy or all strategies."""
-        all_strats = {
-            "momentum": MomentumStrategy(),
-            # mean_reversion removed: historical backtest over 44K markets shows
-            # Sharpe -0.001, 28.8% win rate, zero edge. Confirmed money loser.
-            "consensus": ConsensusStrategy(),
-            "resolution_rider": ResolutionRiderStrategy(),
-            "favorite_bias": FavoriteBiasStrategy(
-                min_favorite_price=75,  # Raised from 70 — skip soft favorites
-                max_entry_price=80,     # Don't overpay for BTC
-                asset_overrides={
-                    "KXETH": {"min_fav": 80, "max_entry": 84},  # Tightened max_entry from 85
-                    "KXSOL": {"min_fav": 85, "max_entry": 89},  # Tightened max_entry from 90
-                },
-            ),
-        }
-        if strategy_name == "all":
-            return all_strats
-        if strategy_name in all_strats:
-            return {strategy_name: all_strats[strategy_name]}
-        print(f"WARNING: Unknown strategy '{strategy_name}', defaulting to consensus")
-        return {"consensus": all_strats["consensus"]}
+        """Initialize the trading strategies. Only Resolution Rider remains;
+        momentum/mean_reversion/consensus/favorite_bias were removed after
+        backtests showed zero edge and live results confirmed it.
+        """
+        return {"resolution_rider": ResolutionRiderStrategy()}
 
     def _resolve_unsettled_trades(self):
         """On startup, check if any trades from previous runs can be settled now."""
@@ -1175,10 +1122,7 @@ class TradingBot:
         self._log(f"  Max Loss:   ${self.config['max_daily_loss']:.2f}/day")
         self._log(f"  Mode:       {'PAPER' if self.config['paper_trade'] else 'LIVE'}")
         self._log(f"  Polling:    full speed (WebSocket)")
-        self._log(
-            f"  Early exits: {'ENABLED' if self._early_exits_enabled else 'DISABLED'} "
-            f"(hold to settlement)"
-        )
+        self._log("  Exits:      hold to settlement (RR thesis)")
         # Start WebSocket feeds for real-time data
         self.ws_feed.start()
         RTIFeed.start_shared_ws()
@@ -1257,19 +1201,34 @@ class TradingBot:
                 scanner = asset["scanner"]
                 market = scanner.get_next_expiring_market()
                 if market:
+                    yes_bid, yes_ask = scanner.parse_yes_price(market)
                     asset["_rr_market"] = {
                         "ticker": market.get("ticker", ""),
                         "close_time": market.get("close_time", ""),
                         "floor_strike": market.get("floor_strike"),
+                        "yes_bid": yes_bid,
+                        "yes_ask": yes_ask,
                     }
-                    # Also cache near-certain markets for hourly/daily
+                    # Also cache near-certain markets for hourly/daily.
+                    # Scanner fetches via REST and runs its own WS-first /
+                    # REST-fallback parse. We store the bid/ask alongside
+                    # ticker metadata so the fast path has a fallback when
+                    # the live WS hasn't received a tick for a quiet daily
+                    # strike (which turned out to be ~70% of btc_hourly
+                    # cached strikes — the "no_ws_tick" debug counter).
                     if asset.get("is_daily"):
-                        rr_markets = scanner.get_near_certain_markets(max_hours=8/60)
-                        asset["_rr_daily_markets"] = [
-                            {"ticker": m.get("ticker",""), "close_time": m.get("close_time",""),
-                             "floor_strike": m.get("floor_strike")}
-                            for m in rr_markets
-                        ]
+                        rr_markets = scanner.get_near_certain_markets(max_hours=1.0)
+                        cached = []
+                        for m in rr_markets:
+                            yb, ya = scanner.parse_yes_price(m)
+                            cached.append({
+                                "ticker": m.get("ticker", ""),
+                                "close_time": m.get("close_time", ""),
+                                "floor_strike": m.get("floor_strike"),
+                                "yes_bid": yb,
+                                "yes_ask": ya,
+                            })
+                        asset["_rr_daily_markets"] = cached
             except Exception:
                 pass
 
@@ -1283,9 +1242,32 @@ class TradingBot:
         if not rr:
             return
 
+        # Debug counters (aggregate per-cell, flushed every 60s).
+        # Added 2026-04-14 to diagnose the "no trades" issue — if this
+        # hasn't been needed in a while you can delete it.
+        if not hasattr(self, "_frr_debug"):
+            from collections import Counter
+            self._frr_debug = {
+                "counts": Counter(),
+                "last_flush": time.time(),
+            }
+        dbg = self._frr_debug
+        if time.time() - dbg["last_flush"] >= 60:
+            dbg["last_flush"] = time.time()
+            if dbg["counts"]:
+                summary = ", ".join(
+                    f"{k}={v}" for k, v in sorted(dbg["counts"].items())
+                )
+                self._log(f"  [FRR-DBG] last 60s: {summary}")
+            dbg["counts"].clear()
+
+        def bump(cell, reason):
+            dbg["counts"][f"{cell}.{reason}"] += 1
+
         for key, asset in self.assets.items():
             cache = asset.get("_rr_market")
             if not cache:
+                bump(key, "no_cache")
                 continue
 
             # Get per-cell optimized params (or skip if cell is disabled)
@@ -1293,6 +1275,7 @@ class TradingBot:
             cell_name = key.replace("_daily", "_hourly") if is_daily else f"{key}_15m"
             cell_params = self._rr_cell_params.get(cell_name)
             if not cell_params:
+                bump(cell_name, "no_cell")
                 continue  # Cell not in safe list
 
             # Override RR params for this cell
@@ -1302,13 +1285,19 @@ class TradingBot:
             # Build list of markets to check (main + hourly/daily extras)
             markets_to_check = [cache]
             if is_daily:
-                markets_to_check = asset.get("_rr_daily_markets", [cache])
+                markets_to_check = asset.get("_rr_daily_markets") or []
+
+            if not markets_to_check:
+                bump(cell_name, "no_markets")
+                continue
 
             for market_cache in markets_to_check:
                 ticker = market_cache.get("ticker", "")
                 if not ticker:
+                    bump(cell_name, "no_ticker")
                     continue
                 if ticker in self._traded_tickers or ticker in self.risk_mgr.open_positions:
+                    bump(cell_name, "already_traded")
                     continue
 
                 # Time check from cached close_time (no I/O)
@@ -1317,31 +1306,55 @@ class TradingBot:
                     close_dt = datetime.fromisoformat(close_str)
                     secs_left = max(0, (close_dt - datetime.now(timezone.utc)).total_seconds())
                 except (ValueError, TypeError):
+                    bump(cell_name, "bad_close_time")
                     continue
-                if secs_left < rr.min_seconds or secs_left > cell_max_secs:
+                if secs_left < rr.min_seconds:
+                    bump(cell_name, "secs_too_low")
+                    continue
+                if secs_left > cell_max_secs:
+                    bump(cell_name, "secs_too_high")
                     continue
 
-                # WS price check (real-time, zero I/O)
+                # Price check — prefer live WS, fall back to cached REST
+                # bid/ask from _refresh_rr_cache. Fallback is important for
+                # daily strikes that aren't actively quoted on WS but do
+                # have REST-cached prices (scanner's own lookup).
                 tick = self.ws_feed.get_tick(ticker)
-                if not tick or not tick.yes_bid or not tick.yes_ask:
-                    continue
+                if tick and tick.yes_bid and tick.yes_ask:
+                    bid, ask = tick.yes_bid, tick.yes_ask
+                else:
+                    bid = market_cache.get("yes_bid")
+                    ask = market_cache.get("yes_ask")
+                    if not bid or not ask:
+                        bump(cell_name, "no_price")
+                        continue
 
                 cell_min_cp = cell_params.get("min_contract_price", rr.min_contract_price)
                 cell_max_ep = cell_params.get("max_entry_price", rr.max_entry_price)
-                yes_mid = (tick.yes_bid + tick.yes_ask) / 2
+                yes_mid = (bid + ask) / 2
                 fav = max(yes_mid, 100 - yes_mid)
-                if fav < cell_min_cp or fav > cell_max_ep:
+                if fav < cell_min_cp:
+                    bump(cell_name, "fav_too_low")
+                    continue
+                if fav > cell_max_ep:
+                    bump(cell_name, "fav_too_high")
                     continue
 
                 # Price buffer check (WS-cached crypto price, zero I/O)
                 feed = asset["price_feed"]
-                if not feed.current_price or not market_cache.get("floor_strike"):
+                if not feed.current_price:
+                    bump(cell_name, "no_spot")
+                    continue
+                if not market_cache.get("floor_strike"):
+                    bump(cell_name, "no_strike")
                     continue
                 try:
                     strike = float(market_cache["floor_strike"])
                 except (ValueError, TypeError):
+                    bump(cell_name, "bad_strike")
                     continue
                 if strike <= 0:
+                    bump(cell_name, "bad_strike")
                     continue
                 buffer_pct = (feed.current_price - strike) / strike * 100
 
@@ -1350,10 +1363,12 @@ class TradingBot:
                 if yes_mid >= no_mid:
                     # YES side favored — price must be ABOVE strike by buffer
                     if buffer_pct < cell_buffer:
+                        bump(cell_name, "yes_buf_low")
                         continue
                 else:
                     # NO side favored — price must be BELOW strike by buffer
                     if buffer_pct > -cell_buffer:
+                        bump(cell_name, "no_buf_high")
                         continue
 
                 # Passed all fast checks — do full evaluation and trade
@@ -1361,36 +1376,51 @@ class TradingBot:
                     "ticker": ticker,
                     "close_time": market_cache["close_time"],
                     "floor_strike": market_cache["floor_strike"],
-                    "yes_bid": tick.yes_bid,
-                    "yes_ask": tick.yes_ask,
+                    "yes_bid": bid,
+                    "yes_ask": ask,
                 }
 
-                # Use a lightweight shim scanner (WS data only)
+                # Use a lightweight shim scanner — close over the resolved
+                # bid/ask (not the raw WS tick) so evaluate() sees what we
+                # just gate-checked, including the REST fallback case.
                 class _FastShim:
-                    def __init__(shim, ws, client, mkt):
+                    def __init__(shim, ws, client, mkt, _bid, _ask, _secs):
                         shim._ws = ws
                         shim.client = client
                         shim._mkt = mkt
+                        shim._bid = _bid
+                        shim._ask = _ask
+                        shim._secs = _secs
                     def seconds_until_close(shim, market):
-                        return secs_left
+                        return shim._secs
                     def parse_yes_price(shim, market):
-                        return (tick.yes_bid, tick.yes_ask)
+                        return (shim._bid, shim._ask)
 
-                shim = _FastShim(self.ws_feed, self.client, market_dict)
+                shim = _FastShim(self.ws_feed, self.client, market_dict, bid, ask, secs_left)
                 rec = rr.evaluate(market_dict, None, feed, shim,
-                                  min_buffer_override=cell_buffer)
+                                  cell_params=cell_params)
                 if not rec.should_trade:
+                    bump(cell_name, "eval_no_trade")
                     continue
 
                 # Check matrix
                 if not self.strategy_matrix.is_enabled(key, "resolution_rider"):
+                    bump(cell_name, "matrix_disabled")
                     continue
 
                 self._log(f"  [FAST-RR] Hit: {ticker} {rec.reason}")
                 strats = {"resolution_rider": rec}
+                # Dedupe against the slow path: on daily markets the slow
+                # path checks an event_key = ticker without the strike suffix
+                # (e.g. KXSOLD-26APR1412 from KXSOLD-26APR1412-T85.9999), so
+                # adding just `ticker` leaves the slow path unaware and it
+                # fires a second order on the same market. Add both.
                 self._traded_tickers.add(ticker)
-                stake_override = asset.get("stake_override")
-                self._maybe_trade(market_dict, strats, stake_override=stake_override, asset_key=key)
+                if is_daily:
+                    parts = ticker.rsplit("-", 1)
+                    if len(parts) > 1:
+                        self._traded_tickers.add(parts[0])
+                self._maybe_trade(market_dict, strats, asset_key=key)
 
     def _start_fast_rr_thread(self):
         """Start the fast RR scanner in a dedicated high-frequency thread."""
@@ -1473,32 +1503,6 @@ class TradingBot:
             with ThreadPoolExecutor(max_workers=3) as pool:
                 pool.map(lambda mf: mf.fetch_all(), self.multi_feeds.values())
 
-        # 2. Detect volatility regime and apply dynamic parameters
-        btc_feed = self.assets["btc"]["price_feed"]
-        regime_params = self._regime_params = self.vol_detector.get_params(btc_feed)
-        if self._current_regime != regime_params.regime:
-            self._current_regime = regime_params.regime
-            self._log(f"  [VOL] Regime: {regime_params.regime.value.upper()}")
-
-        # Apply regime params to exit monitor
-        self.exit_monitor.stop_loss_cents = regime_params.stop_loss_cents
-        self.exit_monitor.trailing_distance = regime_params.trailing_distance
-        self.exit_monitor.trailing_activation = regime_params.trailing_activation
-
-        # Apply regime params to risk manager
-        self.risk_mgr.config.kelly_fraction = regime_params.kelly_fraction
-        self.risk_mgr.config.max_position_pct = regime_params.max_position_pct
-
-        # Apply regime params to strategies
-        for name, strategy in self.strategies.items():
-            if name == "favorite_bias":
-                strategy.min_favorite_price = regime_params.fav_min_favorite
-                strategy.max_entry_price = regime_params.fav_max_entry
-            elif name == "momentum":
-                strategy.min_momentum_pct = regime_params.momentum_threshold
-            elif name == "consensus":
-                strategy.min_edge = regime_params.consensus_min_edge
-
         # 3. Iterate all assets: scan markets, evaluate strategies, trade
         all_markets = {}
         all_last_settled = {}
@@ -1519,144 +1523,29 @@ class TradingBot:
             except Exception as e:
                 self._log(f"  [WARN] Settlement check failed for {key}: {e}", level="warning")
 
-            # Check open positions for early exit (both paper and live)
-            if market:
-                self._check_early_exits(market, scanner, feed)
-
-            # Feed contract prices into KL-divergence signal
-            if market:
-                yes_bid_kl, yes_ask_kl = scanner.parse_yes_price(market)
-                if yes_bid_kl is not None and yes_ask_kl is not None:
-                    yes_mid = (yes_bid_kl + yes_ask_kl) // 2
-                    self.kl_signal.update_price(key, yes_mid)
-
-                # Feed Bayesian updater for any open positions on this market
-                ticker_bayes = market.get("ticker", "")
-                if ticker_bayes in self.risk_mgr.open_positions:
-                    btc_price = feed.current_price
-                    mom = feed.momentum_1m()
-                    secs = scanner.seconds_until_close(market)
-                    if btc_price:
-                        posterior = self.bayesian.update(
-                            ticker_bayes, btc_price,
-                            momentum_1m=mom,
-                            seconds_remaining=secs,
-                            contract_price_cents=yes_mid if yes_bid_kl else None,
-                        )
-                        # Bayesian early exit signal — log for monitoring.
-                        # Don't force exit based on Bayesian alone — the model
-                        # tracks BTC price change from entry, NOT distance from
-                        # strike. It can signal "exit" on a winning position if
-                        # BTC moved slightly toward the strike but is still
-                        # comfortably on the right side.
-                        record = self.risk_mgr.open_positions[ticker_bayes]
-                        if (posterior is not None
-                            and self.bayesian.should_exit(ticker_bayes, record.price_cents / 100.0)
-                            and self._early_exits_enabled):
-                            # Only log and attempt exit when the early-exit
-                            # mechanism is enabled. Otherwise the log spammed
-                            # every tick with no corresponding action.
-                            self._log(f"  [BAYES] Posterior collapsed to {posterior:.0%} for {ticker_bayes}, triggering early exit check")
-                            self._check_early_exits(market, scanner, feed)
-
-            # Evaluate strategies against this asset's market + price feed
-            # All (asset, strategy) combos start in shadow mode and must prove
-            # edge before getting real money. The matrix handles enable/disable.
+            # Resolution Rider is the only strategy. It runs entirely in the
+            # fast-RR thread (bot.py:_fast_rr_scan) at 20Hz with per-cell
+            # optimized params. The slow tick path only builds a strategies
+            # dict for the dashboard — it does NOT trade RR, since doing so
+            # with defaults would bypass cell_params gating (e.g. let a 96c
+            # YES fire with 8 minutes left when cell says max_seconds=60).
             is_daily = asset.get("is_daily", False)
             strats = {}
-
-            # For hourly/daily series, find ALL 95-99c strikes across every
-            # event window (hourly AND daily). The main market is chosen for
-            # favorite_bias (70-90c range), so resolution_rider needs its own.
-            # Only enter hourly/daily resolution_rider in the last 5 minutes.
-            # 15M markets are naturally constrained; hourly/daily at 95c with
-            # 12+ min left can still flip (lost 2 trades at 755s left).
-            rr_markets = scanner.get_near_certain_markets(max_hours=8/60) if is_daily else []
-
-            for name, strategy in self.strategies.items():
-                # Regime filter: skip strategies disabled by volatility regime
-                if name == "favorite_bias" and not regime_params.fav_bias_enabled:
-                    strats[name] = type("R", (), {
-                        "signal": Signal.NO_TRADE, "confidence": 0,
-                        "reason": f"Disabled in {regime_params.regime.value} vol regime",
-                        "should_trade": False,
-                    })()
-                elif name == "momentum" and not regime_params.momentum_enabled:
-                    strats[name] = type("R", (), {
-                        "signal": Signal.NO_TRADE, "confidence": 0,
-                        "reason": f"Disabled in {regime_params.regime.value} vol regime",
-                        "should_trade": False,
-                    })()
-                elif name == "consensus" and not regime_params.consensus_enabled:
-                    strats[name] = type("R", (), {
-                        "signal": Signal.NO_TRADE, "confidence": 0,
-                        "reason": f"Disabled in {regime_params.regime.value} vol regime",
-                        "should_trade": False,
-                    })()
-                else:
-                    if name == "resolution_rider" and rr_markets:
-                        # Evaluate RR against the best 95c+ strike (hourly/daily: 0.5% buffer)
-                        rec = strategy.evaluate(rr_markets[0], last_settled, feed, scanner, min_buffer_override=0.5)
-                        strats[name] = rec
-                    elif market is not None:
-                        rec = strategy.evaluate(market, last_settled, feed, scanner)
-                        strats[name] = rec
-                    else:
-                        strats[name] = type("R", (), {
-                            "signal": Signal.NO_TRADE, "confidence": 0,
-                            "reason": "No active market", "should_trade": False,
-                        })()
+            rr_strategy = self.strategies.get("resolution_rider")
+            if rr_strategy is not None and market is not None:
+                cell_name = key.replace("_daily", "_hourly") if is_daily else f"{key}_15m"
+                cell_params = self._rr_cell_params.get(cell_name)
+                # Display-only evaluation: shows the current RR assessment on
+                # the dashboard but never triggers a trade from this path.
+                rec = rr_strategy.evaluate(market, last_settled, feed, scanner,
+                                            cell_params=cell_params)
+                strats["resolution_rider"] = rec
             all_strategies[key] = strats
 
-            # Also try additional 95c+ strikes from other event windows
-            # (e.g., daily 5pm market while the hourly is also running)
-            if is_daily and len(rr_markets) > 1:
-                rr_strategy = self.strategies.get("resolution_rider")
-                for extra_rr in rr_markets[1:]:
-                    extra_ticker = extra_rr.get("ticker", "")
-                    if extra_ticker in self._traded_tickers:
-                        continue
-                    if extra_ticker in self.risk_mgr.open_positions:
-                        continue
-                    rec = rr_strategy.evaluate(extra_rr, last_settled, feed, scanner, min_buffer_override=0.5)
-                    if rec.should_trade:
-                        extra_strats = {"resolution_rider": rec}
-                        stake_override = asset.get("stake_override")
-                        self._maybe_trade(extra_rr, extra_strats, stake_override=stake_override, asset_key=key)
-
-            # Cross-asset signal boost using KL-divergence + BTC settlement
-            if key != "btc":
-                for name, rec in strats.items():
-                    if not rec.should_trade:
-                        continue
-
-                    # KL-divergence boost: adjust confidence based on
-                    # cross-asset mispricing detection
-                    kl_boost = self.kl_signal.get_confidence_boost(
-                        key, rec.signal.value
-                    )
-                    if kl_boost != 0:
-                        rec.confidence = max(0.1, min(0.95, rec.confidence + kl_boost))
-                        if kl_boost > 0:
-                            rec.reason += f" [+KL {kl_boost:+.0%}]"
-                        else:
-                            rec.reason += f" [KL divergence {kl_boost:+.0%}]"
-
-                    # BTC settlement boost (existing logic)
-                    btc_settled = all_last_settled.get("btc")
-                    if btc_settled and btc_settled.get("result"):
-                        btc_result = btc_settled["result"]
-                        if rec.signal.value == btc_result:
-                            rec.confidence = min(0.95, rec.confidence + 0.05)
-                            rec.reason += f" [+BTC {btc_result} boost]"
-
-            # Execute trades if asset is enabled AND global trading is on
+            # Execute trades only if global trading is on.
             with _sse_state.lock:
-                # Map daily asset keys to their base for the toggle
-                toggle_key = key.replace("_daily", "")
-                asset_enabled = _sse_state.enabled_assets.get(toggle_key, True)
                 trading_on = _sse_state.trading_enabled
-            if market and asset_enabled and trading_on:
+            if market and trading_on:
                 ticker = market.get("ticker", "")
                 # For daily markets with multiple strikes (KXBTCD-26APR0702-T68899.99),
                 # use the event prefix (KXBTCD-26APR0702) to prevent trading multiple
@@ -1667,15 +1556,10 @@ class TradingBot:
                 else:
                     event_key = ticker
                 if ticker and event_key not in self._traded_tickers:
-                    stake_override = asset.get("stake_override")
-                    self._maybe_trade(market, strats, stake_override=stake_override, asset_key=key)
+                    self._maybe_trade(market, strats, asset_key=key)
 
         # 2a. Refresh RR market cache for the fast path (every 10s)
         self._refresh_rr_cache()
-
-        # 2b. Broad scanner disabled — can't trade non-crypto without price
-        # feeds for the buffer check, and the REST sweep adds API load.
-        # self._tick_broad_scanner()
 
         # 3. Display status for primary asset
         primary_key = next(iter(self.assets))
@@ -1709,115 +1593,60 @@ class TradingBot:
             if "edge=" in summary:
                 self._log(f"\n{summary}")
 
+    # Coins whose spot prices we persist to data/prices/YYYY-MM-DD.csv.
+    # Must match the 15M series the bot trades so optimize_rr can compute
+    # per-coin momentum features for every RR cell.
+    PRICE_SNAPSHOT_COINS = ("btc", "eth", "sol", "doge", "xrp", "bnb", "hype")
+
     def _save_price_snapshot(self):
-        """Save 1-minute price candles for future backtesting."""
+        """Save 1-minute price candles for future backtesting.
+
+        Persists every tradeable coin so optimize_rr can compute momentum
+        and buffer features for all RR cells, not just BTC/ETH/SOL.
+
+        Header mismatch handling: if a pre-existing file's header doesn't
+        match `PRICE_SNAPSHOT_COINS`, the old file is rotated aside and a
+        new one is started with the current schema. This prevents the
+        mixed-schema corruption that happened on 2026-04-14 when the coin
+        list was extended from 3 to 7 while a partial file already existed.
+        """
         try:
             price_dir = Path("data/prices")
             price_dir.mkdir(parents=True, exist_ok=True)
             date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             price_file = price_dir / f"{date_str}.csv"
 
-            # Write header if new file
+            header = ["timestamp", *self.PRICE_SNAPSHOT_COINS]
+
+            if price_file.exists():
+                # Check the existing header. If it doesn't match, rotate.
+                with open(price_file, "r", newline="") as f:
+                    first = f.readline().rstrip("\r\n")
+                existing_header = first.split(",") if first else []
+                if existing_header != header:
+                    ts = datetime.now(timezone.utc).strftime("%H%M%S")
+                    rotated = price_file.with_suffix(f".csv.schema_mismatch_{ts}")
+                    price_file.rename(rotated)
+                    self._log(
+                        f"  [PRICE-SNAPSHOT] Header mismatch in {price_file.name}, "
+                        f"rotated to {rotated.name} and starting fresh",
+                        level="warning",
+                    )
+
             if not price_file.exists():
                 with open(price_file, "w", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["timestamp", "btc", "eth", "sol"])
+                    csv.writer(f).writerow(header)
 
-            # Append current prices
-            row = [
-                datetime.now(timezone.utc).isoformat(),
-                self.assets["btc"]["price_feed"].current_price or "",
-                self.assets["eth"]["price_feed"].current_price or "",
-                self.assets["sol"]["price_feed"].current_price or "",
-            ]
+            row = [datetime.now(timezone.utc).isoformat()]
+            for coin in self.PRICE_SNAPSHOT_COINS:
+                feed = self.assets.get(coin, {}).get("price_feed")
+                row.append(feed.current_price if feed and feed.current_price else "")
             with open(price_file, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(row)
+                csv.writer(f).writerow(row)
         except Exception:
             pass  # Don't let price saving crash the bot
 
-    def _tick_broad_scanner(self):
-        """Evaluate resolution_rider against broad market scanner candidates."""
-        try:
-            candidates = self.broad_scanner.get_candidates()
-        except Exception as e:
-            if not hasattr(self, '_broad_err_count'):
-                self._broad_err_count = 0
-            self._broad_err_count += 1
-            if self._broad_err_count <= 3 or self._broad_err_count % 50 == 0:
-                self._log(f"  [BROAD] Scanner error ({self._broad_err_count}x): {e}", level="warning")
-            return
-
-        if not candidates:
-            return
-
-        balance = self._get_balance()
-        rr_strategy = self.strategies.get("resolution_rider")
-        if not rr_strategy:
-            return
-
-        for candidate in candidates:
-            ticker = candidate.get("ticker", "")
-            if not ticker or ticker in self._traded_tickers:
-                continue
-
-            # Already have a position on this market
-            if ticker in self.risk_mgr.open_positions:
-                continue
-
-            # Build a lightweight market dict compatible with resolution_rider.evaluate()
-            # The strategy only needs: ticker, close_time, and bid/ask from scanner
-            market_dict = {
-                "ticker": ticker,
-                "close_time": candidate.get("close_time", ""),
-                "yes_bid": candidate["_yes_bid"],
-                "yes_ask": candidate["_yes_ask"],
-            }
-
-            # Use a shim scanner that returns the WS-sourced bid/ask
-            class _BroadShim:
-                def __init__(self, ws_feed, client, mkt):
-                    self._ws = ws_feed
-                    self.client = client
-                    self._mkt = mkt
-                def seconds_until_close(self, market):
-                    close_str = market.get("close_time", "").replace("Z", "+00:00")
-                    try:
-                        close_dt = datetime.fromisoformat(close_str)
-                        return max(0, (close_dt - datetime.now(timezone.utc)).total_seconds())
-                    except (ValueError, TypeError):
-                        return 0
-                def parse_yes_price(self, market):
-                    return (self._mkt["yes_bid"], self._mkt["yes_ask"])
-                def get_orderbook(self, ticker, depth=1):
-                    # Needed by _maybe_trade for order placement
-                    return self.client.get_orderbook(ticker, depth=depth)
-
-            shim = _BroadShim(self.ws_feed, self.client, market_dict)
-
-            rec = rr_strategy.evaluate(market_dict, None, None, shim)
-            if not rec.should_trade:
-                continue
-
-            # Check strategy matrix — use "broad" as the asset key
-            series = candidate.get("series_ticker", "broad")
-            if not self.strategy_matrix.is_enabled("broad", "resolution_rider"):
-                # Shadow-track the trade for the matrix
-                # (We'll record the outcome when it settles)
-                pass
-
-            # Build strategy dict for _maybe_trade
-            strats = {"resolution_rider": rec}
-            self._traded_tickers.add(ticker)
-            self.broad_scanner.mark_traded(ticker)
-
-            self._log(f"  [BROAD] Candidate: {ticker} ({candidate['rr_side'].upper()} "
-                      f"@{candidate['rr_price']}c, {candidate['rr_secs_left']:.0f}s left, "
-                      f"vol={candidate['rr_volume']:.0f})")
-
-            self._maybe_trade(market_dict, strats, asset_key="broad")
-
-    def _maybe_trade(self, market: dict, strategies_status: dict, stake_override: float = None, asset_key: str = ""):
+    def _maybe_trade(self, market: dict, strategies_status: dict, asset_key: str = ""):
         """Check if any strategy wants to trade and execute if approved."""
         ticker = market.get("ticker", "")
         balance = self._get_balance()
@@ -1890,34 +1719,11 @@ class TradingBot:
                     "timestamp": time.time(),
                 }
 
-        # ── Conflict resolution: if multiple strategies want to trade,
-        # pick the best one. Don't allow opposing signals on the same market.
+        # Only resolution_rider remains; the only filter is the strategy matrix.
         candidates = [
             (name, rec) for name, rec in strategies_status.items()
-            if rec.should_trade
-            and not self.strategy_tracker.is_suspended(name)[0]
-            and self.strategy_matrix.is_enabled(asset_key, name)
+            if rec.should_trade and self.strategy_matrix.is_enabled(asset_key, name)
         ]
-
-        if len(candidates) > 1:
-            yes_cands = [(n, r) for n, r in candidates if r.signal == Signal.BUY_YES]
-            no_cands = [(n, r) for n, r in candidates if r.signal == Signal.BUY_NO]
-
-            if yes_cands and no_cands:
-                # Opposing signals — pick the side with the best calibrated edge
-                self._log(f"  [CONFLICT] {len(yes_cands)} YES vs {len(no_cands)} NO on {ticker}")
-
-                def _score(name, rec):
-                    cal_p = self.calibrator.calibrate(name, rec.confidence)
-                    edge = cal_p - rec.max_price_cents / 100.0
-                    return cal_p * max(0, edge)
-
-                best = max(candidates, key=lambda x: _score(x[0], x[1]))
-                candidates = [best]
-            else:
-                # All agree on direction — pick highest calibrated confidence
-                best = max(candidates, key=lambda x: self.calibrator.calibrate(x[0], x[1].confidence))
-                candidates = [best]
 
         for name, rec in candidates:
             if not rec.should_trade:
@@ -1926,25 +1732,6 @@ class TradingBot:
             side = rec.signal.value  # "yes" or "no"
             max_price = rec.max_price_cents  # strategy's ceiling price
 
-            # Calibrate confidence: map raw heuristic to empirical win probability
-            calibrated_p = self.calibrator.calibrate(name, rec.confidence)
-
-            # Walk-forward validated bypasses: don't let the calibrator's
-            # small-sample shrinkage override backtest-proven probabilities.
-            # Evidence: 12-month out-of-sample walk-forward (Oct 2024 - Nov 2025)
-            # - Favorite bias: 11,820 trades, 89% WR, 12/12 months profitable
-            # - Resolution rider: 18,316 trades, 98% WR, 12/12 months profitable
-            # - Consensus: 4,204 trades, 56% WR, 10/11 months profitable
-            if name == "favorite_bias" and rec.confidence >= 0.75:
-                calibrated_p = max(calibrated_p, rec.confidence)
-            elif name == "resolution_rider" and rec.confidence >= 0.60:
-                calibrated_p = max(calibrated_p, rec.confidence)
-            elif name == "consensus" and rec.confidence >= 0.80:
-                calibrated_p = max(calibrated_p, rec.confidence)
-
-            # Determine execution price using time-aware maker/taker logic.
-            # With enough time, post passive limit orders (maker, lower fees).
-            # Near expiry, cross the spread for guaranteed fills (taker).
             if side == "yes":
                 ask_price = yes_ask if yes_ask is not None else max_price
                 bid_price = yes_bid if yes_bid is not None else (ask_price - 4)
@@ -1952,50 +1739,33 @@ class TradingBot:
                 ask_price = (100 - yes_bid) if yes_bid is not None else max_price
                 bid_price = (100 - yes_ask) if yes_ask is not None else (ask_price - 4)
 
-            # Don't trade if the ask exceeds strategy's max
             if ask_price > max_price:
                 continue
 
-            secs_remaining = scanner.seconds_until_close(market)
-            if name == "resolution_rider":
-                # Resolution rider: always cross the ask (taker). The edge is
-                # only 1-5c so getting filled at the right price matters more
-                # than saving fees. Maker midpoint can drop below 95c minimum.
-                exec_price = min(ask_price, max_price)
-                is_maker = False
-            elif secs_remaining > 600:
-                # >10 min: passive maker — post at bid+1c
-                exec_price = min(bid_price + 1, max_price)
-                is_maker = True
-            elif secs_remaining > 300:
-                # 5-10 min: post at midpoint (still likely maker)
-                exec_price = min((bid_price + ask_price) // 2, max_price)
-                is_maker = True
-            else:
-                # <5 min: cross at the ask (taker, guaranteed fill)
-                exec_price = min(ask_price, max_price)
-                is_maker = False
+            # RR always crosses the ask (taker). The edge is only 1-5c, so
+            # getting filled at the right price matters more than saving
+            # maker fees, and a maker midpoint can drop below the 95c minimum.
+            exec_price = min(ask_price, max_price)
+            is_maker = False
 
-            # Hard floor: never place an RR order outside the strategy's
-            # [min_contract_price, max_entry_price] band. Prevents the
-            # 2026-04-13 "NO@1c" incident where a market flipped between
-            # RR evaluation and order submission, causing exec_price to
-            # collapse while the sanity check was bypassed by a one-sided
-            # book (no_bids empty → yes_ask None → sanity check skipped).
-            # This guard catches the failure unconditionally at the site
-            # where exec_price is known to be final.
-            if name == "resolution_rider":
-                strat = self.strategies.get("resolution_rider")
-                strat_min = strat.min_contract_price if strat else 95
-                strat_max = strat.max_entry_price if strat else 98
-                if exec_price < strat_min or exec_price > strat_max:
-                    self._log(
-                        f"  [SKIP] {name}: exec_price {exec_price}c outside "
-                        f"[{strat_min}, {strat_max}]c band "
-                        f"(book may have moved between signal and submission)",
-                        level="warning",
-                    )
-                    continue
+            # Hard floor: never submit an RR order outside the cell's
+            # [min_contract_price, max_entry_price] band. Guards against the
+            # 2026-04-13 "NO@1c" incident where a market flipped between the
+            # RR signal and order submission (one-sided book → yes_ask None
+            # → earlier sanity check bypassed).
+            strat = self.strategies.get("resolution_rider")
+            strat_min = strat.min_contract_price if strat else 95
+            strat_max = strat.max_entry_price if strat else 98
+            if exec_price < strat_min or exec_price > strat_max:
+                self._log(
+                    f"  [SKIP] {name}: exec_price {exec_price}c outside "
+                    f"[{strat_min}, {strat_max}]c band "
+                    f"(book moved between signal and submission)",
+                    level="warning",
+                )
+                continue
+
+            calibrated_p = rec.confidence
 
             # Risk check using actual execution price
             approved, reason = self.risk_mgr.approve_trade(
@@ -2009,35 +1779,19 @@ class TradingBot:
             if not approved:
                 continue
 
-            # Position sizing — different approach per strategy
-            if name == "resolution_rider":
-                # Fixed stake from .env, no Kelly sizing
-                MAX_RESOLUTION_RIDER_STAKE = float(os.getenv("RESOLUTION_RIDER_STAKE_USD", "10.00"))
-                price_frac = exec_price / 100.0
-                if price_frac > 0:
-                    contracts = max(1, int(MAX_RESOLUTION_RIDER_STAKE / price_frac))
-                    stake = contracts * price_frac
-                else:
-                    contracts = 1
-                    stake = price_frac
+            # RR position sizing: single flat STAKE_USD (read once in
+            # load_config, piped via self.config). No Kelly — the edge
+            # is 1-5c with ~98% WR, so variance is low enough that flat
+            # sizing beats Kelly's aggressiveness and the single knob is
+            # easier to reason about than the old 3-way stake soup.
+            flat_stake = self.config["stake_usd"]
+            price_frac = exec_price / 100.0
+            if price_frac > 0:
+                contracts = max(1, int(flat_stake / price_frac))
+                stake = contracts * price_frac
             else:
-                # Other strategies: standard sizing with $3 cap
-                orig_stake = self.risk_mgr.config.stake_usd
-                effective_override = stake_override
-                if effective_override:
-                    self.risk_mgr.config.stake_usd = effective_override
-                contracts = self.risk_mgr.calculate_contracts(
-                    exec_price, confidence=rec.confidence, balance_usd=balance,
-                    calibrated_probability=calibrated_p,
-                )
-                self.risk_mgr.config.stake_usd = orig_stake
-                stake = contracts * (exec_price / 100.0)
-
-                # Cap max loss per trade (optimized: $3 gives best Sortino)
-                MAX_LOSS_PER_TRADE = 3.00
-                if stake > MAX_LOSS_PER_TRADE:
-                    contracts = max(1, int(MAX_LOSS_PER_TRADE / (exec_price / 100.0)))
-                    stake = contracts * (exec_price / 100.0)
+                contracts = 1
+                stake = price_frac
 
             # If stake exceeds available balance, downsize to fit remaining cash
             # rather than skipping entirely. Only skip if even 1 contract won't fit.
@@ -2052,21 +1806,18 @@ class TradingBot:
                 contracts = new_contracts
                 stake = new_stake
 
-            # Fee-adjusted EXPECTED VALUE check
-            entry_fee_fn = kalshi_maker_fee if is_maker else kalshi_taker_fee
-            entry_fee = entry_fee_fn(contracts, exec_price)
+            # Fee-adjusted EV check. RR uses empirical win rate (~99%) for
+            # EV, not market-implied price: the edge IS the gap between the
+            # 95-98c entry and the ~99% hold-to-settlement win rate.
+            entry_fee = kalshi_taker_fee(contracts, exec_price)
             payout = contracts * 1.00
-
-            # Resolution rider uses empirical win rate (99%) for EV, not market price
-            # The edge IS the gap between price (95c) and actual win rate (99%)
-            ev_prob = 0.99 if name == "resolution_rider" else calibrated_p
+            ev_prob = 0.99
             ev_win = ev_prob * (payout - stake - entry_fee)
             ev_loss = (1 - ev_prob) * (stake + entry_fee)
             expected_value = ev_win - ev_loss
             if expected_value <= 0:
                 self._log(f"  [SKIP] {name}: negative EV after fees "
-                          f"(EV=${expected_value:.2f}, raw_conf={rec.confidence:.0%}, "
-                          f"cal_p={calibrated_p:.0%}, fees=${entry_fee:.2f})")
+                          f"(EV=${expected_value:.2f}, fees=${entry_fee:.2f})")
                 continue
 
             # Execute — mark ticker BEFORE placing order to prevent re-entry
@@ -2079,25 +1830,50 @@ class TradingBot:
             # For Kalshi API: yes_price is always in YES terms
             api_yes_price = exec_price if side == "yes" else (100 - exec_price)
 
-            order_mode = "MAKER" if is_maker else "TAKER"
+            order_mode = "TAKER"
 
-            # Log orderbook depth for resolution_rider to gauge available liquidity
-            if name == "resolution_rider":
-                try:
-                    _depth_book = scanner.client.get_orderbook(ticker, depth=10)
-                    _ob = _depth_book.get("orderbook", {})
-                    _yes_bids = _ob.get("yes", [])
-                    _no_bids = _ob.get("no", [])
-                    # Available to buy YES at 95-99c = NO bids where 100-price is 95-99
-                    _yes_available = [(100 - p, q) for p, q in _no_bids if 95 <= (100 - p) <= 99]
-                    # Available to buy NO at 95-99c = YES bids where 100-price is 95-99
-                    _no_available = [(100 - p, q) for p, q in _yes_bids if 95 <= (100 - p) <= 99]
-                    _our_depth = _yes_available if side == "yes" else _no_available
-                    _total_cts = sum(q for _, q in _our_depth)
-                    _depth_str = ", ".join(f"{p}c:{q:.0f}" for p, q in sorted(_our_depth))
-                    self._log(f"      [DEPTH] {side.upper()} 95-99c: {_total_cts:.0f} contracts available [{_depth_str}]")
-                except Exception:
-                    self._log(f"      [DEPTH] Could not fetch orderbook")
+            # Log orderbook depth at 95-99c. Kalshi's modern API returns
+            # `orderbook_fp` (dollar-string prices) not `orderbook` (cent
+            # integers), so we parse both schemas — the legacy .get("orderbook")
+            # path always returned empty and the log was useless.
+            try:
+                _depth_book = scanner.client.get_orderbook(ticker, depth=10)
+                _yes_levels = []  # (cents, qty) pairs, each level
+                _no_levels = []
+                _fp = _depth_book.get("orderbook_fp")
+                if _fp:
+                    for lvl in _fp.get("yes_dollars", []) or []:
+                        try:
+                            _yes_levels.append((int(round(float(lvl[0]) * 100)), float(lvl[1])))
+                        except (ValueError, TypeError, IndexError):
+                            continue
+                    for lvl in _fp.get("no_dollars", []) or []:
+                        try:
+                            _no_levels.append((int(round(float(lvl[0]) * 100)), float(lvl[1])))
+                        except (ValueError, TypeError, IndexError):
+                            continue
+                else:
+                    _legacy = _depth_book.get("orderbook", {}) or {}
+                    for lvl in _legacy.get("yes", []) or []:
+                        try:
+                            _yes_levels.append((int(lvl[0]), float(lvl[1])))
+                        except (ValueError, TypeError, IndexError):
+                            continue
+                    for lvl in _legacy.get("no", []) or []:
+                        try:
+                            _no_levels.append((int(lvl[0]), float(lvl[1])))
+                        except (ValueError, TypeError, IndexError):
+                            continue
+                # Available to BUY YES at 95-99c = NO bids whose (100-p)
+                # lands in 95-99; same for NO.
+                _yes_available = [(100 - p, q) for p, q in _no_levels if 95 <= (100 - p) <= 99]
+                _no_available = [(100 - p, q) for p, q in _yes_levels if 95 <= (100 - p) <= 99]
+                _our_depth = _yes_available if side == "yes" else _no_available
+                _total_cts = sum(q for _, q in _our_depth)
+                _depth_str = ", ".join(f"{p}c:{q:.0f}" for p, q in sorted(_our_depth))
+                self._log(f"      [DEPTH] {side.upper()} 95-99c: {_total_cts:.0f} contracts available [{_depth_str}]")
+            except Exception as e:
+                self._log(f"      [DEPTH] Could not fetch orderbook: {e}")
 
             self._log(f"\n  >>> {name.upper()}: BUY {contracts} {side.upper()} @ {exec_price}c on {ticker} "
                       f"(${stake:.2f}, fees=${entry_fee:.2f}, bal=${balance:.2f}, {order_mode})")
@@ -2124,12 +1900,12 @@ class TradingBot:
                     if fill_price is not None and fill_price != exec_price:
                         exec_price = fill_price
                         stake = contracts * (exec_price / 100.0)
-                        entry_fee = entry_fee_fn(contracts, exec_price)
+                        entry_fee = kalshi_taker_fee(contracts, exec_price)
                     filled_count = result.get("order", {}).get("contracts_filled")
                     if filled_count is not None and filled_count < contracts:
                         contracts = filled_count
                         stake = contracts * (exec_price / 100.0)
-                        entry_fee = entry_fee_fn(contracts, exec_price)
+                        entry_fee = kalshi_taker_fee(contracts, exec_price)
                 else:
                     result = self.executor.place_order(
                         ticker=ticker,
@@ -2143,11 +1919,42 @@ class TradingBot:
 
                 order_id = result.get("order", {}).get("order_id", client_oid)
 
+                # Reserve the order_id in the CSV immediately. Closes the
+                # reconcile race: the reconcile thread scans `all_oids` from
+                # the CSV and imports any Kalshi fill whose oid isn't in the
+                # set as `kalshi_api_import`. Without this preliminary row,
+                # a partially-filled order can be snatched by reconcile
+                # before the fill-wait loop finishes, which is what produced
+                # the phantom "no trade from current run_id" situation.
+                pending_record = TradeRecord(
+                    timestamp=time.time(),
+                    ticker=ticker,
+                    strategy=name,
+                    side=side,
+                    price_cents=exec_price,
+                    contracts=contracts,
+                    stake_usd=stake,
+                    order_id=order_id,
+                    client_order_id=client_oid,
+                    is_maker=is_maker,
+                )
+                self.logger.upsert_entry(
+                    pending_record, reason=f"PLACED: {rec.reason}", confidence=rec.confidence,
+                )
+
                 # Live mode: verify the order was filled
                 if not self.config["paper_trade"]:
                     order_status = result.get("order", {}).get("status", "")
                     if order_status not in ("filled", "resting", "executed"):
                         self._log(f"      [WARN] Order status: {order_status} — skipping record")
+                        # Mark the reserved row as rejected so reconcile
+                        # doesn't try to fill it with actual Kalshi state.
+                        pending_record.contracts = 0
+                        pending_record.stake_usd = 0
+                        self.logger.upsert_entry(
+                            pending_record, reason=f"REJECTED: status={order_status}",
+                            confidence=rec.confidence,
+                        )
                         continue
                     if order_status == "resting":
                         # Order is on the book — poll for fill.
@@ -2191,7 +1998,7 @@ class TradingBot:
                                             pass
                                         contracts = fill_count
                                         stake = contracts * (exec_price / 100.0)
-                                        entry_fee = entry_fee_fn(contracts, exec_price)
+                                        entry_fee = kalshi_taker_fee(contracts, exec_price)
                                         self._log(f"      [PARTIAL] Filled {fill_count} contracts, cancelled remainder")
                                         filled = True
                                         break
@@ -2226,7 +2033,7 @@ class TradingBot:
                                     if fill_count < contracts:
                                         contracts = fill_count
                                         stake = contracts * (exec_price / 100.0)
-                                        entry_fee = entry_fee_fn(contracts, exec_price)
+                                        entry_fee = kalshi_taker_fee(contracts, exec_price)
                                     filled = True
                             except Exception:
                                 pass
@@ -2250,10 +2057,19 @@ class TradingBot:
                                 # Keep the partial fill — we own these contracts
                                 contracts = fill_count
                                 stake = contracts * (exec_price / 100.0)
-                                entry_fee = entry_fee_fn(contracts, exec_price)
+                                entry_fee = kalshi_taker_fee(contracts, exec_price)
                                 self._log(f"      [PARTIAL] Keeping {fill_count} filled contracts after cancel")
                                 filled = True
                             else:
+                                # Mark the reserved row as cancelled so reconcile
+                                # doesn't resurrect it or import a phantom row.
+                                pending_record.contracts = 0
+                                pending_record.stake_usd = 0
+                                self.logger.upsert_entry(
+                                    pending_record,
+                                    reason=f"CANCELLED: unfilled after {max_wait}s",
+                                    confidence=rec.confidence,
+                                )
                                 continue
 
                 self._log(f"      Order placed: {order_id}")
@@ -2311,18 +2127,11 @@ class TradingBot:
                     is_maker=is_maker,
                 )
                 self.risk_mgr.record_trade(record)
-                self.logger.log_trade(record, reason=rec.reason, confidence=rec.confidence)
-
-                # Register with Bayesian updater using calibrated probability as prior
-                btc_feed = self.assets.get("btc", {}).get("price_feed")
-                btc_px = btc_feed.current_price if btc_feed else None
-                if btc_px:
-                    self.bayesian.register(
-                        ticker=ticker,
-                        prior=calibrated_p,
-                        direction=side,
-                        entry_btc_price=btc_px,
-                    )
+                # upsert_entry rewrites the PLACED row we wrote earlier with
+                # the final filled shape (actual contracts, actual fees, etc.).
+                # Falls through to append-only if no matching oid row exists
+                # (paper mode or unexpected state).
+                self.logger.upsert_entry(record, reason=rec.reason, confidence=rec.confidence)
 
                 # Add to dashboard trade list
                 self._dashboard_trades.insert(0, {
@@ -2346,274 +2155,9 @@ class TradingBot:
             except Exception as e:
                 self._log(f"\n      ERROR placing order: {e}", level="error")
 
-    def _check_early_exits(self, market: dict, scanner, price_feed):
-        """Check open positions on this market for early exit signals."""
-        # Early exits disabled 2026-04-13 — hold every RR position to
-        # settlement. See __init__ for the rationale (stop-loss whipsaws).
-        if not self._early_exits_enabled:
-            return
-        ticker = market.get("ticker", "")
-        if ticker not in self.risk_mgr.open_positions:
-            return
-        # Cross-path dedup: if any exit path already submitted a sell on this
-        # ticker (even if it's still resting on the book, not yet filled),
-        # don't fire another one. Prevents the 2026-04-13 repeated-sell bug
-        # where a pending limit order caused 5 sells of the same 102 contracts.
-        if not hasattr(self, '_exit_pending'):
-            self._exit_pending = set()
-        if ticker in self._exit_pending:
-            return
-
-        record = self.risk_mgr.open_positions[ticker]
-        secs_left = scanner.seconds_until_close(market)
-
-        # Get current book prices
-        try:
-            book = scanner.client.get_orderbook(ticker, depth=1)
-            yes_bid, yes_ask = parse_book_top(book)
-        except Exception:
-            yes_bid, yes_ask = scanner.parse_yes_price(market)
-
-        if yes_bid is None or yes_ask is None:
-            return
-
-        mom_1m = price_feed.momentum_1m()
-        rec = self.exit_monitor.check_position(
-            ticker=ticker,
-            side=record.side,
-            entry_price_cents=record.price_cents,
-            current_yes_bid=yes_bid,
-            current_yes_ask=yes_ask,
-            seconds_remaining=secs_left,
-            momentum_1m=mom_1m,
-        )
-
-        if not rec.should_exit:
-            return
-
-        # Execute the sell
-        self._log(f"\n  <<< EXIT {ticker}: {rec.reason}")
-
-        sell_side = record.side  # Sell the same side we hold
-        # Exit price: YES sells at yes_bid; NO sells at 100-yes_ask
-        if sell_side == "yes":
-            exit_price = yes_bid
-        else:
-            exit_price = 100 - yes_ask
-
-        if self.config["paper_trade"]:
-            # Paper mode: simulate the sell at current book price
-            exit_proceeds = record.contracts * (exit_price / 100.0)
-            record.outcome = "win" if exit_proceeds > record.stake_usd else "loss"
-            record.payout_usd = exit_proceeds
-            record.profit_usd = exit_proceeds - record.stake_usd
-            record.profit_after_fees = record.profit_usd - record.entry_fee_usd
-            self.risk_mgr.open_positions.pop(ticker, None)
-            if record.profit_usd < 0:
-                self.risk_mgr._last_loss_ts = time.time()
-
-            self._log(f"      [PAPER] Sold {record.contracts} {sell_side} @ {exit_price}c (P&L: ${record.profit_usd:+.2f})")
-            self.logger.log_settlement(record)
-            self.perf_tracker.record(record.profit_usd, record.timestamp)
-            self._record_outcome(record)
-
-            # Update dashboard
-            for dt in self._dashboard_trades:
-                if dt["ticker"] == ticker and dt["outcome"] == "pending":
-                    dt["outcome"] = record.outcome
-                    dt["profit"] = round(record.profit_usd, 2)
-                    dt["profit_after_fees"] = round(record.profit_after_fees, 2)
-                    break
-        else:
-            # Live mode: place a real sell order
-            try:
-                if sell_side == "yes":
-                    sell_yes_price = yes_bid
-                else:
-                    sell_yes_price = yes_ask  # selling NO at yes_ask
-
-                # Mark as exit-pending BEFORE submitting, so concurrent exit
-                # paths can't fire a second sell while this one is in flight.
-                self._exit_pending.add(ticker)
-
-                # reduce_only is CRITICAL: without it, Kalshi treats "sell yes"
-                # as opening a new short (equivalent to a new NO long) rather
-                # than closing the existing long YES. That's what caused the
-                # 2026-04-13 XRP "buy NO at 20c" incident.
-                result = self.client.place_order(
-                    ticker=ticker,
-                    action="sell",
-                    side=sell_side,
-                    count=record.contracts,
-                    order_type="limit",
-                    yes_price=sell_yes_price,
-                    reduce_only=True,
-                )
-
-                order_status = result.get("order", {}).get("status", "")
-                if order_status in ("executed", "filled"):
-                    exit_proceeds = record.contracts * (exit_price / 100.0)
-                    record.outcome = "win" if exit_proceeds > record.stake_usd else "loss"
-                    record.payout_usd = exit_proceeds
-                    record.profit_usd = exit_proceeds - record.stake_usd
-                    record.profit_after_fees = record.profit_usd - record.entry_fee_usd
-                    self.risk_mgr.open_positions.pop(ticker, None)
-                    if record.profit_usd < 0:
-                        self.risk_mgr._last_loss_ts = time.time()
-
-                    self._log(f"      Sold {record.contracts} {sell_side} @ {exit_price}c (P&L: ${record.profit_usd:+.2f})")
-                    self.logger.log_settlement(record)
-                    self.perf_tracker.record(record.profit_usd, record.timestamp)
-                    self._record_outcome(record)
-
-                    # Update dashboard
-                    for dt in self._dashboard_trades:
-                        if dt["ticker"] == ticker and dt["outcome"] == "pending":
-                            dt["outcome"] = record.outcome
-                            dt["profit"] = round(record.profit_usd, 2)
-                            dt["profit_after_fees"] = round(record.profit_after_fees, 2)
-                            break
-                elif order_status == "canceled":
-                    # IoC + reduce_only: order was cancelled because nothing
-                    # filled (price moved, or no match). Clear the guard so
-                    # the next tick can retry at a fresh price.
-                    self._exit_pending.discard(ticker)
-                    self._log(
-                        f"      [WARN] Exit canceled (IoC unfilled at {sell_yes_price}c); "
-                        f"will retry next tick."
-                    )
-                else:
-                    self._log(
-                        f"      [WARN] Exit order resting (status={order_status}); "
-                        f"keeping ticker in _exit_pending to block re-fire. "
-                        f"Position will reconcile on fill/settlement."
-                    )
-            except Exception as e:
-                # Placement failed — clear the guard so a later tick can retry.
-                self._exit_pending.discard(ticker)
-                self._log(f"      [WARN] Exit failed: {e}", level="warning")
-
-    def _force_early_exit(self, ticker: str, record, scanner, reason: str):
-        """Force an early exit when Bayesian posterior collapses.
-
-        Bypasses the exit_monitor's stop loss threshold — the Bayesian signal
-        is faster and more accurate than stale orderbook prices.
-        """
-        # Early exits disabled 2026-04-13 — hold every RR position to
-        # settlement. The bayesian-collapse exit was also whipsawing on the
-        # same trades as the stop loss.
-        if not self._early_exits_enabled:
-            return
-        if ticker not in self.risk_mgr.open_positions:
-            return
-
-        # Cross-path dedup shared with _check_early_exits.
-        if not hasattr(self, '_exit_pending'):
-            self._exit_pending = set()
-        if ticker in self._exit_pending:
-            return
-
-        # Legacy per-path guard (kept for belt-and-suspenders)
-        if not hasattr(self, '_bayes_exit_attempted'):
-            self._bayes_exit_attempted = set()
-        if ticker in self._bayes_exit_attempted:
-            return
-        self._bayes_exit_attempted.add(ticker)
-
-        # Get current book prices for the exit
-        try:
-            book = scanner.client.get_orderbook(ticker, depth=1)
-            yes_bid, yes_ask = parse_book_top(book)
-        except Exception:
-            self._log(f"      [WARN] Bayesian exit: couldn't get orderbook for {ticker}")
-            return
-
-        if yes_bid is None or yes_ask is None:
-            return
-
-        sell_side = record.side
-        if sell_side == "yes":
-            exit_price = yes_bid
-        else:
-            exit_price = 100 - yes_ask
-
-        self._log(f"\n  <<< BAYES EXIT {ticker}: {reason}")
-
-        if self.config["paper_trade"]:
-            exit_proceeds = record.contracts * (exit_price / 100.0)
-            record.outcome = "win" if exit_proceeds > record.stake_usd else "loss"
-            record.payout_usd = exit_proceeds
-            record.profit_usd = exit_proceeds - record.stake_usd
-            record.profit_after_fees = record.profit_usd - record.entry_fee_usd
-            self.risk_mgr.open_positions.pop(ticker, None)
-            if record.profit_usd < 0:
-                self.risk_mgr._last_loss_ts = time.time()
-
-            self._log(f"      [PAPER] Sold {record.contracts} {sell_side} @ {exit_price}c (P&L: ${record.profit_usd:+.2f})")
-            self.logger.log_settlement(record)
-            self.perf_tracker.record(record.profit_usd, record.timestamp)
-            self._record_outcome(record)
-        else:
-            try:
-                sell_yes_price = yes_bid if sell_side == "yes" else yes_ask
-                # Mark pending BEFORE submitting (cross-path dedup).
-                self._exit_pending.add(ticker)
-                # reduce_only=True: close the existing position, don't open a new one.
-                result = self.client.place_order(
-                    ticker=ticker,
-                    action="sell",
-                    side=sell_side,
-                    count=record.contracts,
-                    order_type="limit",
-                    yes_price=sell_yes_price,
-                    reduce_only=True,
-                )
-
-                order_status = result.get("order", {}).get("status", "")
-                if order_status in ("executed", "filled"):
-                    exit_proceeds = record.contracts * (exit_price / 100.0)
-                    record.outcome = "win" if exit_proceeds > record.stake_usd else "loss"
-                    record.payout_usd = exit_proceeds
-                    record.profit_usd = exit_proceeds - record.stake_usd
-                    record.profit_after_fees = record.profit_usd - record.entry_fee_usd
-                    self.risk_mgr.open_positions.pop(ticker, None)
-                    if record.profit_usd < 0:
-                        self.risk_mgr._last_loss_ts = time.time()
-
-                    self._log(f"      Sold {record.contracts} {sell_side} @ {exit_price}c (P&L: ${record.profit_usd:+.2f})")
-                    self.logger.log_settlement(record)
-                    self.perf_tracker.record(record.profit_usd, record.timestamp)
-                    self._record_outcome(record)
-                elif order_status == "canceled":
-                    # IoC + reduce_only: cancelled unfilled. Allow retry.
-                    self._exit_pending.discard(ticker)
-                    self._bayes_exit_attempted.discard(ticker)
-                    self._log(
-                        f"      [WARN] Bayes exit canceled (IoC unfilled at {sell_yes_price}c); "
-                        f"will retry next tick."
-                    )
-                else:
-                    self._log(
-                        f"      [WARN] Bayes exit order resting (status={order_status}); "
-                        f"keeping ticker in _exit_pending to block re-fire. "
-                        f"Position will reconcile on fill/settlement."
-                    )
-            except Exception as e:
-                # Placement failed — clear both guards so a later tick can retry.
-                self._exit_pending.discard(ticker)
-                self._bayes_exit_attempted.discard(ticker)
-                self._log(f"      [WARN] Bayes exit failed: {e}", level="warning")
-
-        self.bayesian.clear(ticker)
-        self.exit_monitor.clear_ticker(ticker)
-
-        # Update dashboard
-        for dt in self._dashboard_trades:
-            if dt["ticker"] == ticker and dt["outcome"] == "pending":
-                dt["outcome"] = record.outcome
-                dt["profit"] = round(record.profit_usd, 2)
-                dt["profit_after_fees"] = round(record.profit_after_fees, 2)
-                break
+    # Early-exit and Bayesian-exit methods were removed 2026-04-14 after
+    # live results showed they whipsawed ~$60 of profits on 2026-04-13. RR
+    # holds every position to settlement — no mid-trade exit logic remains.
 
     def _check_settlements(self):
         """Check settlements across all asset scanners + broad positions."""
@@ -2651,8 +2195,6 @@ class TradingBot:
                     self.logger.log_settlement(record)
                     self.perf_tracker.record(record.profit_usd, record.timestamp)
                     self._record_outcome(record)
-                    if self.broad_scanner:
-                        self.broad_scanner.clear_traded(ticker)
                     for dt in self._dashboard_trades:
                         if dt["ticker"] == ticker and dt["outcome"] == "pending":
                             dt["outcome"] = record.outcome
@@ -2690,7 +2232,6 @@ class TradingBot:
             if not result:
                 continue
             self.risk_mgr.settle_trade(ticker, result)
-            self.bayesian.clear(ticker)
             self._resolve_shadow_trades(ticker, result)  # Settle shadow trades too
             record = next(
                 (t for t in self.risk_mgr.trades if t.ticker == ticker and t.outcome != ""),
@@ -2799,19 +2340,65 @@ class TradingBot:
     def _publish_tick(self, all_markets, all_last_settled, all_strategies):
         """Build TickData JSON and push to the SSE server."""
 
-        # Helper: build price data for an asset
+        # Helper: build price data for an asset, including the exact
+        # momentum the RR cell uses for entry gating (cell window/periods)
+        # plus the cell's max_adverse_momentum gate for context.
         def _price_data(key):
             feed = self.assets[key]["price_feed"]
+            # Match the runtime cell — 15M for primary, hourly for _daily.
+            if key.endswith("_daily"):
+                cell_name = key.replace("_daily", "_hourly")
+            else:
+                cell_name = f"{key}_15m"
+            cell = self._rr_cell_params.get(cell_name, {})
+            cell_window = cell.get("momentum_window", 60)
+            cell_periods = cell.get("momentum_periods", 5)
+            vol_lookback = cell.get("vol_lookback", 300)
+            cell_mom = None
+            if hasattr(feed, "momentum_smoothed"):
+                cell_mom = feed.momentum_smoothed(window=cell_window, periods=cell_periods)
+            realized_vol = None
+            if hasattr(feed, "volatility"):
+                realized_vol = feed.volatility(lookback_seconds=vol_lookback)
             return {
                 "price": feed.current_price or 0,
                 "mom_1m": feed.momentum_1m() or 0,
                 "mom_5m": feed.momentum_5m() or 0,
+                "mom_cell": round(cell_mom, 4) if cell_mom is not None else None,
+                "mom_window": cell_window,
+                "mom_periods": cell_periods,
+                "mom_gate": cell.get("max_adverse_momentum"),
+                "realized_vol": round(realized_vol, 4) if realized_vol is not None else None,
+                "vol_gate": cell.get("max_realized_vol_pct"),
+                "vol_lookback": vol_lookback,
                 "prices": [[int(ts * 1000), px] for ts, px in feed.prices][-180:],
             }
 
         btc = _price_data("btc")
         eth = _price_data("eth")
         sol = _price_data("sol")
+
+        # Gather momentum for every tradeable coin so the dashboard can
+        # show the exact values the bot uses for RR gating. Avoids the
+        # guesswork that led to the 2026-04-14 XRP/SOL losses where we
+        # were blind to the live momentum on non-BTC coins.
+        asset_momentum = {}
+        for coin in ("btc", "eth", "sol", "doge", "xrp", "bnb", "hype"):
+            if coin not in self.assets:
+                continue
+            pd = _price_data(coin)
+            asset_momentum[coin] = {
+                "price": round(pd["price"], 4) if pd["price"] else 0,
+                "mom_1m": round(pd["mom_1m"], 4),
+                "mom_5m": round(pd["mom_5m"], 4),
+                "mom_cell": pd["mom_cell"],
+                "mom_window": pd["mom_window"],
+                "mom_periods": pd["mom_periods"],
+                "mom_gate": pd["mom_gate"],
+                "realized_vol": pd["realized_vol"],
+                "vol_gate": pd["vol_gate"],
+                "vol_lookback": pd["vol_lookback"],
+            }
 
         def _parse_strike(val):
             """Convert strike price from API (string/int/float/None) to float or None."""
@@ -2860,26 +2447,16 @@ class TradingBot:
                 return None
             return {"ticker": ls.get("ticker", ""), "result": ls["result"]}
 
-        # Strategy signals — build per-asset, ensure all 5 are present
-        all_strategy_names = [
-            "momentum", "mean_reversion", "consensus",
-            "resolution_rider", "favorite_bias",
-        ]
-
         def _strat_data(key):
             status = all_strategies.get(key, {})
-            data = {}
-            for name in all_strategy_names:
-                rec = status.get(name)
-                if rec:
-                    data[name] = {
-                        "signal": rec.signal.value if rec.signal.value != "none" else "none",
-                        "confidence": round(rec.confidence, 2),
-                        "reason": rec.reason,
-                    }
-                else:
-                    data[name] = {"signal": "none", "confidence": 0, "reason": ""}
-            return data
+            rec = status.get("resolution_rider")
+            if rec:
+                return {"resolution_rider": {
+                    "signal": rec.signal.value if rec.signal.value != "none" else "none",
+                    "confidence": round(rec.confidence, 2),
+                    "reason": rec.reason,
+                }}
+            return {"resolution_rider": {"signal": "none", "confidence": 0, "reason": ""}}
 
         # OFI
         ofi = fetch_ofi()
@@ -2931,9 +2508,9 @@ class TradingBot:
                 "eth": _strat_data("eth"),
                 "sol": _strat_data("sol"),
             },
-            "enabled_assets": dict(_sse_state.enabled_assets),
+            "asset_momentum": asset_momentum,
             "trading_enabled": _sse_state.trading_enabled,
-            "vol_regime": self._regime_params.regime.value if hasattr(self, '_regime_params') and self._regime_params else "medium",
+            "vol_regime": "medium",  # Vol-regime gating removed; RR uses per-cell optimized params.
             "vol_reading": round(self.assets["btc"]["price_feed"].volatility(300) or 0, 4),
             "ofi": round(ofi, 4),
             "exchange_data": {
@@ -2980,12 +2557,16 @@ class TradingBot:
                     "max_seconds": rr.max_seconds,
                     "min_price_buffer_pct": rr.min_price_buffer_pct,
                     "max_adverse_momentum": rr.max_adverse_momentum,
-                    "max_stake_usd": 10.0,
+                    "max_stake_usd": self.config["stake_usd"],
                 },
                 "per_cell": {k: {
                     "price": f"{v['min_contract_price']}-{v['max_entry_price']}c",
                     "max_secs": v["max_seconds"],
                     "buffer": f"{v['min_price_buffer_pct']}%",
+                    "mom_gate": v.get("max_adverse_momentum"),
+                    "mom_window": v.get("momentum_window"),
+                    "mom_periods": v.get("momentum_periods"),
+                    "vol_gate": v.get("max_realized_vol_pct"),
                     "cv_wr": v.get("cv_mean_win_rate"),
                     "cv_trades": v.get("cv_total_val_trades", 0),
                 } for k, v in self._rr_cell_params.items()},
@@ -2997,12 +2578,12 @@ class TradingBot:
 
     def _asset_key_from_ticker(self, ticker: str) -> str:
         """Derive the asset key from a market ticker for matrix tracking."""
-        if "KXBTC15M" in ticker: return "btc"
-        if "KXBTCD" in ticker: return "btc_daily"
-        if "KXETH15M" in ticker: return "eth"
-        if "KXETHD" in ticker: return "eth_daily"
-        if "KXSOL15M" in ticker: return "sol"
-        if "KXSOLD" in ticker: return "sol_daily"
+        for coin in ("btc", "eth", "sol", "doge", "xrp", "bnb", "hype"):
+            uc = coin.upper()
+            if f"KX{uc}15M" in ticker:
+                return coin
+            if f"KX{uc}D" in ticker:
+                return f"{coin}_daily"
         return "unknown"
 
     def _resolve_shadow_trades(self, ticker: str, result: str):
@@ -3044,9 +2625,7 @@ class TradingBot:
             del self._shadow_pending[key]
 
     def _record_outcome(self, record):
-        """Record a trade outcome to both strategy_tracker and strategy_matrix."""
-        self.strategy_tracker.record_outcome(record.strategy, record.profit_usd)
-        # Refresh historical stats so dashboard P&L stays current
+        """Record a trade outcome to the strategy matrix and refresh stats."""
         self._hist_stats = self.logger.get_historical_stats()
         asset_key = self._asset_key_from_ticker(record.ticker)
         self.strategy_matrix.record_trade(

@@ -8,6 +8,22 @@ export const strategySignalSchema = z.object({
   reason: z.string(),
 });
 
+// Live per-coin momentum values the bot uses for RR entry gating.
+// Included so the dashboard shows the exact numbers the bot sees,
+// not just proxies from BTC-only data.
+export const assetMomentumSchema = z.object({
+  price: z.number(),
+  mom_1m: z.number(),
+  mom_5m: z.number(),
+  mom_cell: z.number().nullable(),
+  mom_window: z.number(),
+  mom_periods: z.number(),
+  mom_gate: z.number().nullable().optional(),
+  realized_vol: z.number().nullable().optional(),
+  vol_gate: z.number().nullable().optional(),
+  vol_lookback: z.number().optional(),
+});
+
 export const tradeSchema = z.object({
   time: z.string(),
   ticker: z.string(),
@@ -54,11 +70,7 @@ export const tickDataSchema = z.object({
     result: z.enum(["yes", "no"]),
   }).nullable(),
   strategies: z.object({
-    momentum: strategySignalSchema,
-    mean_reversion: strategySignalSchema,
-    consensus: strategySignalSchema,
     resolution_rider: strategySignalSchema,
-    favorite_bias: strategySignalSchema,
   }),
   markets: z.object({
     btc: marketDataSchema.nullable(),
@@ -71,33 +83,13 @@ export const tickDataSchema = z.object({
     sol: z.object({ ticker: z.string(), result: z.enum(["yes", "no"]) }).nullable(),
   }),
   strategies_by_asset: z.object({
-    btc: z.object({
-      momentum: strategySignalSchema,
-      mean_reversion: strategySignalSchema,
-      consensus: strategySignalSchema,
-      resolution_rider: strategySignalSchema,
-      favorite_bias: strategySignalSchema,
-    }),
-    eth: z.object({
-      momentum: strategySignalSchema,
-      mean_reversion: strategySignalSchema,
-      consensus: strategySignalSchema,
-      resolution_rider: strategySignalSchema,
-      favorite_bias: strategySignalSchema,
-    }),
-    sol: z.object({
-      momentum: strategySignalSchema,
-      mean_reversion: strategySignalSchema,
-      consensus: strategySignalSchema,
-      resolution_rider: strategySignalSchema,
-      favorite_bias: strategySignalSchema,
-    }),
+    btc: z.object({ resolution_rider: strategySignalSchema }),
+    eth: z.object({ resolution_rider: strategySignalSchema }),
+    sol: z.object({ resolution_rider: strategySignalSchema }),
   }),
-  enabled_assets: z.object({
-    btc: z.boolean(),
-    eth: z.boolean(),
-    sol: z.boolean(),
-  }),
+  asset_momentum: z.record(assetMomentumSchema).optional(),
+  // enabled_assets removed 2026-04-14 — the only runtime control is
+  // the global `trading_enabled` pause.
   trading_enabled: z.boolean(),
   vol_regime: z.enum(["low", "medium", "high"]),
   vol_reading: z.number(),
@@ -147,6 +139,10 @@ export const tickDataSchema = z.object({
       price: z.string(),
       max_secs: z.number(),
       buffer: z.string(),
+      mom_gate: z.number().nullable().optional(),
+      mom_window: z.number().nullable().optional(),
+      mom_periods: z.number().nullable().optional(),
+      vol_gate: z.number().nullable().optional(),
       cv_wr: z.number().nullable(),
       cv_trades: z.number(),
     })),
@@ -183,4 +179,5 @@ export const tickDataSchema = z.object({
 export type StrategySignal = z.infer<typeof strategySignalSchema>;
 export type Trade = z.infer<typeof tradeSchema>;
 export type MarketData = z.infer<typeof marketDataSchema>;
+export type AssetMomentum = z.infer<typeof assetMomentumSchema>;
 export type TickData = z.infer<typeof tickDataSchema>;

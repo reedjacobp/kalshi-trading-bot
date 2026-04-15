@@ -210,8 +210,8 @@ class RiskManager:
 
         Args:
             calibrated_probability: If provided, use this as the win
-                probability instead of raw confidence. This should be
-                the output of ConfidenceCalibrator.calibrate().
+                probability instead of raw confidence. Pass an empirical
+                win rate here to override the raw strategy confidence.
         """
         if price_cents <= 0 or price_cents >= 100:
             return 0

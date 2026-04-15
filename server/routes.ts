@@ -78,38 +78,15 @@ export async function registerRoutes(
           current_market: null,
           last_settled: null,
           strategies: {
-            momentum: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-            mean_reversion: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-            consensus: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
             resolution_rider: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-            favorite_bias: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
           },
           markets: { btc: null, eth: null, sol: null },
           settled: { btc: null, eth: null, sol: null },
           strategies_by_asset: {
-            btc: {
-              momentum: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-              mean_reversion: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-              consensus: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-              resolution_rider: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-              favorite_bias: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-            },
-            eth: {
-              momentum: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-              mean_reversion: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-              consensus: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-              resolution_rider: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-              favorite_bias: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-            },
-            sol: {
-              momentum: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-              mean_reversion: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-              consensus: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-              resolution_rider: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-              favorite_bias: { signal: "none", confidence: 0, reason: "Waiting for bot..." },
-            },
+            btc: { resolution_rider: { signal: "none", confidence: 0, reason: "Waiting for bot..." } },
+            eth: { resolution_rider: { signal: "none", confidence: 0, reason: "Waiting for bot..." } },
+            sol: { resolution_rider: { signal: "none", confidence: 0, reason: "Waiting for bot..." } },
           },
-          enabled_assets: { btc: true, eth: true, sol: true },
           trading_enabled: true,
           vol_regime: "medium",
           vol_reading: 0,
@@ -172,7 +149,6 @@ export async function registerRoutes(
     });
   };
 
-  proxyPost("/api/toggle-asset");
   proxyPost("/api/toggle-trading");
 
 

@@ -42,9 +42,18 @@ class ResolutionRiderStrategy(Strategy):
         min_contract_price: int = 95,   # Only enter at 95c+ on the favored side
         max_entry_price: int = 98,      # 99c loses money after taker fees
         min_seconds: int = 10,          # Don't trade in final 10s (settlement risk)
-        max_seconds: int = 480,         # Last 8 min — buffer check is the real safety gate
+        max_seconds: int = 60,          # Cell params override this; default is tight
         min_price_buffer_pct: float = 0.15,  # 0.15% — safe given 60s CFB RTI averaging at settlement
         max_adverse_momentum: float = -0.05,  # Block if smoothed trend moving toward strike faster than this
+        momentum_window: int = 60,      # Seconds per momentum reading (cell params override)
+        momentum_periods: int = 5,      # Number of readings to smooth over
+        # Realized-volatility filter: rejects entries when stddev of
+        # per-tick returns over `vol_lookback` exceeds `max_realized_vol_pct`.
+        # Catches "chop" regimes where momentum looks flat only because
+        # price oscillated through net-zero — those are riskier for
+        # 95-98c YES holds than the momentum gate alone can detect.
+        max_realized_vol_pct: Optional[float] = None,  # None = filter disabled
+        vol_lookback: int = 300,        # Seconds of price history to measure
         kelly_fraction: float = 0.30,   # Fractional Kelly — aggressive but safe
         max_bankroll_pct: float = 0.05, # Max 5% of bankroll per trade
     ):
@@ -54,10 +63,14 @@ class ResolutionRiderStrategy(Strategy):
         self.max_seconds = max_seconds
         self.min_price_buffer_pct = min_price_buffer_pct
         self.max_adverse_momentum = max_adverse_momentum
+        self.momentum_window = momentum_window
+        self.momentum_periods = momentum_periods
+        self.max_realized_vol_pct = max_realized_vol_pct
+        self.vol_lookback = vol_lookback
         self.kelly_fraction = kelly_fraction
         self.max_bankroll_pct = max_bankroll_pct
 
-    def evaluate(self, market, last_settled, price_feed, scanner, min_buffer_override: float = None) -> TradeRecommendation:
+    def evaluate(self, market, last_settled, price_feed, scanner, cell_params: Optional[dict] = None) -> TradeRecommendation:
         no_trade = TradeRecommendation(
             signal=Signal.NO_TRADE,
             confidence=0.0,
@@ -66,14 +79,29 @@ class ResolutionRiderStrategy(Strategy):
             max_price_cents=0,
         )
 
+        # All entry parameters come from cell_params if provided, otherwise
+        # fall back to the strategy instance defaults. This keeps the slow
+        # path, fast path, and backtest simulator in lock-step.
+        cp = cell_params or {}
+        min_cp = cp.get("min_contract_price", self.min_contract_price)
+        max_ep = cp.get("max_entry_price", self.max_entry_price)
+        min_secs = cp.get("min_seconds", self.min_seconds)
+        max_secs = cp.get("max_seconds", self.max_seconds)
+        min_buf = cp.get("min_price_buffer_pct", self.min_price_buffer_pct)
+        max_adv_mom = cp.get("max_adverse_momentum", self.max_adverse_momentum)
+        mom_window = cp.get("momentum_window", self.momentum_window)
+        mom_periods = cp.get("momentum_periods", self.momentum_periods)
+        max_vol = cp.get("max_realized_vol_pct", self.max_realized_vol_pct)
+        vol_lookback = cp.get("vol_lookback", self.vol_lookback)
+
         secs_left = scanner.seconds_until_close(market)
 
-        if secs_left < self.min_seconds:
+        if secs_left < min_secs:
             no_trade.reason = f"Too close to settlement ({secs_left:.0f}s left)"
             return no_trade
 
-        if secs_left > self.max_seconds:
-            no_trade.reason = f"Too far from settlement ({secs_left:.0f}s left, max {self.max_seconds}s)"
+        if secs_left > max_secs:
+            no_trade.reason = f"Too far from settlement ({secs_left:.0f}s left, max {max_secs}s)"
             return no_trade
 
         yes_bid, yes_ask = scanner.parse_yes_price(market)
@@ -103,45 +131,58 @@ class ResolutionRiderStrategy(Strategy):
             no_trade.reason = "Could not parse floor_strike"
             return no_trade
 
-        required_buffer = min_buffer_override if min_buffer_override is not None else self.min_price_buffer_pct
+        # Smoothed momentum using the (window, periods) this cell was
+        # optimized against — identical to optimize_rr.compute_momentum.
+        momentum = None
+        if price_feed and hasattr(price_feed, "momentum_smoothed"):
+            momentum = price_feed.momentum_smoothed(window=mom_window, periods=mom_periods)
+        elif price_feed:
+            momentum = price_feed.momentum_1m()
 
-        # Smoothed momentum: averages 5 periods of 60s each (5 min window).
-        # Aligns with the 60-second CFB RTI averaging used for settlement.
-        momentum = price_feed.momentum_smoothed(window=60, periods=5) if price_feed and hasattr(price_feed, 'momentum_smoothed') else (
-            price_feed.momentum_1m() if price_feed else None
-        )
+        # Realized volatility filter — applies to BOTH YES and NO sides
+        # since chop is direction-agnostic. None on the param disables it.
+        realized_vol = None
+        if max_vol is not None and price_feed and hasattr(price_feed, "volatility"):
+            realized_vol = price_feed.volatility(lookback_seconds=vol_lookback)
+            if realized_vol is not None and realized_vol > max_vol:
+                no_trade.reason = (
+                    f"Blocked: realized vol {realized_vol:.3f}% > "
+                    f"limit {max_vol:.3f}% over {vol_lookback}s"
+                )
+                return no_trade
 
         yes_avg = (yes_bid + yes_ask) / 2
         no_avg = 100 - yes_avg
 
         # YES is the near-certain favorite (95-99c)
-        if yes_avg >= self.min_contract_price:
+        if yes_avg >= min_cp:
             our_price = yes_ask
-            if our_price > self.max_entry_price:
-                no_trade.reason = f"YES@{our_price}c too expensive (max {self.max_entry_price}c)"
+            if our_price > max_ep:
+                no_trade.reason = f"YES@{our_price}c too expensive (max {max_ep}c)"
                 return no_trade
-            if our_price < self.min_contract_price:
-                no_trade.reason = f"YES ask {our_price}c below minimum {self.min_contract_price}c"
+            if our_price < min_cp:
+                no_trade.reason = f"YES ask {our_price}c below minimum {min_cp}c"
                 return no_trade
 
             # For YES (price above strike), buffer must be positive and large enough
-            if buffer_pct is not None and buffer_pct < required_buffer:
+            if buffer_pct is not None and buffer_pct < min_buf:
                 no_trade.reason = (f"YES@{our_price}c but price only {buffer_pct:+.2f}% "
-                                   f"from strike (need +{required_buffer}%)")
+                                   f"from strike (need +{min_buf}%)")
                 return no_trade
 
-            # Momentum logged but not enforced — monitor before enabling
-            # if momentum is not None and momentum < self.max_adverse_momentum:
-            #     no_trade.reason = (f"YES@{our_price}c but price falling "
-            #                        f"({momentum:+.3f}%/min, limit {self.max_adverse_momentum}%)")
-            #     return no_trade
+            # Adverse momentum: for YES we need price rising (or at least
+            # not falling faster than max_adv_mom, which is negative).
+            if max_adv_mom < 0 and momentum is not None and momentum < max_adv_mom:
+                no_trade.reason = (f"YES@{our_price}c blocked: momentum {momentum:+.3f}% "
+                                   f"below limit {max_adv_mom:+.3f}%")
+                return no_trade
 
-            # Confidence = implied probability from price
             confidence = min(0.995, our_price / 100.0)
 
             mom_str = f" [mom={momentum:+.3f}%]" if momentum is not None else ""
+            vol_str = f" [vol={realized_vol:.3f}%]" if realized_vol is not None else ""
             buffer_str = f" [{buffer_pct:+.1f}% from strike]" if buffer_pct is not None else ""
-            buffer_str += mom_str
+            buffer_str += mom_str + vol_str
             return TradeRecommendation(
                 signal=Signal.BUY_YES,
                 confidence=confidence,
@@ -154,32 +195,34 @@ class ResolutionRiderStrategy(Strategy):
             )
 
         # NO is the near-certain favorite (YES < 5c → NO > 95c)
-        if no_avg >= self.min_contract_price:
+        if no_avg >= min_cp:
             our_price = 100 - yes_bid  # NO ask price
-            if our_price > self.max_entry_price:
-                no_trade.reason = f"NO@{our_price}c too expensive (max {self.max_entry_price}c)"
+            if our_price > max_ep:
+                no_trade.reason = f"NO@{our_price}c too expensive (max {max_ep}c)"
                 return no_trade
-            if our_price < self.min_contract_price:
-                no_trade.reason = f"NO price {our_price}c below minimum {self.min_contract_price}c"
+            if our_price < min_cp:
+                no_trade.reason = f"NO price {our_price}c below minimum {min_cp}c"
                 return no_trade
 
             # For NO (price below strike), buffer must be negative and large enough
-            if buffer_pct is not None and buffer_pct > -required_buffer:
+            if buffer_pct is not None and buffer_pct > -min_buf:
                 no_trade.reason = (f"NO@{our_price}c but price only {buffer_pct:+.2f}% "
-                                   f"from strike (need -{required_buffer}%)")
+                                   f"from strike (need -{min_buf}%)")
                 return no_trade
 
-            # Momentum logged but not enforced — monitor before enabling
-            # if momentum is not None and momentum > -self.max_adverse_momentum:
-            #     no_trade.reason = (f"NO@{our_price}c but price rising "
-            #                        f"({momentum:+.3f}%/min, limit {-self.max_adverse_momentum:+.3f}%)")
-            #     return no_trade
+            # Adverse momentum: for NO we need price falling (or at least
+            # not rising faster than -max_adv_mom, which is positive).
+            if max_adv_mom < 0 and momentum is not None and momentum > -max_adv_mom:
+                no_trade.reason = (f"NO@{our_price}c blocked: momentum {momentum:+.3f}% "
+                                   f"above limit {-max_adv_mom:+.3f}%")
+                return no_trade
 
             confidence = min(0.995, our_price / 100.0)
 
             mom_str = f" [mom={momentum:+.3f}%]" if momentum is not None else ""
+            vol_str = f" [vol={realized_vol:.3f}%]" if realized_vol is not None else ""
             buffer_str = f" [{buffer_pct:+.1f}% from strike]" if buffer_pct is not None else ""
-            buffer_str += mom_str
+            buffer_str += mom_str + vol_str
             return TradeRecommendation(
                 signal=Signal.BUY_NO,
                 confidence=confidence,

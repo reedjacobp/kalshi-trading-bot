@@ -123,6 +123,8 @@ class StrategyMatrix:
         cooldown_seconds: float = 300,      # Min time between enable/disable toggles
         persist_path: Optional[str] = None, # Path to persist state across restarts
         strategy_overrides: Optional[dict] = None,  # Per-strategy threshold overrides
+        allowed_assets: Optional[list[str]] = None,  # Whitelist of asset keys
+        allowed_strategies: Optional[list[str]] = None,  # Whitelist of strategy names
     ):
         self.window_size = window_size
         self.disable_threshold = disable_threshold
@@ -134,6 +136,12 @@ class StrategyMatrix:
         self.cooldown_seconds = cooldown_seconds
         self.persist_path = persist_path
         self.strategy_overrides = strategy_overrides or {}
+        # Whitelists prevent the matrix from accumulating stale cells from
+        # deleted strategies or "unknown" tickers. Any (asset, strategy)
+        # tuple outside the whitelists is silently dropped at every
+        # entry point — load, record, force, query.
+        self._allowed_assets = set(allowed_assets) if allowed_assets else None
+        self._allowed_strategies = set(allowed_strategies) if allowed_strategies else None
 
         # The matrix: (asset_key, strategy_name) -> CellState
         self._cells: dict[tuple[str, str], CellState] = defaultdict(CellState)
@@ -142,24 +150,36 @@ class StrategyMatrix:
         if persist_path:
             self._load_state()
 
+    def _is_allowed(self, asset: str, strategy: str) -> bool:
+        if self._allowed_assets is not None and asset not in self._allowed_assets:
+            return False
+        if self._allowed_strategies is not None and strategy not in self._allowed_strategies:
+            return False
+        return True
+
     def _cell_key(self, asset: str, strategy: str) -> tuple[str, str]:
         return (asset, strategy)
 
     def initialize_cells(self, assets: list[str], strategies: list[str]):
         """Pre-create all (asset, strategy) cells so the matrix shows up
         in the dashboard immediately, even before any trades occur."""
+        created = 0
         for asset in assets:
             for strategy in strategies:
+                if not self._is_allowed(asset, strategy):
+                    continue
                 key = self._cell_key(asset, strategy)
                 if key not in self._cells:
                     self._cells[key]  # defaultdict creates with enabled=False
-        logger.info(f"[MATRIX] Initialized {len(assets)}x{len(strategies)} = "
-                    f"{len(assets)*len(strategies)} cells (all shadow mode)")
+                created += 1
+        logger.info(f"[MATRIX] Initialized {created} cells (all shadow mode)")
 
     def force_enable(self, asset: str, strategy: str, clear_history: bool = False):
         """Pre-enable a cell based on external evidence (e.g. walk-forward backtest).
         The cell can still be disabled later if live performance is poor.
         If clear_history=True, wipe the rolling trade window (stale data from old config)."""
+        if not self._is_allowed(asset, strategy):
+            return
         key = self._cell_key(asset, strategy)
         cell = self._cells[key]
         cell.enabled = True
@@ -172,6 +192,8 @@ class StrategyMatrix:
     def force_disable(self, asset: str, strategy: str, hard: bool = False):
         """Force-disable a cell. It must re-prove itself via shadow trading.
         If hard=True, the matrix can never re-enable it automatically."""
+        if not self._is_allowed(asset, strategy):
+            return
         key = self._cell_key(asset, strategy)
         cell = self._cells[key]
         cell.enabled = False
@@ -187,6 +209,8 @@ class StrategyMatrix:
 
     def is_enabled(self, asset: str, strategy: str) -> bool:
         """Check if a (asset, strategy) combination is currently enabled."""
+        if not self._is_allowed(asset, strategy):
+            return False
         key = self._cell_key(asset, strategy)
         if key not in self._cells:
             # First time seeing this cell — create it disabled, start shadow tracking
@@ -196,6 +220,8 @@ class StrategyMatrix:
     def record_trade(self, asset: str, strategy: str, pnl: float,
                      stake: float, outcome: str):
         """Record a completed trade outcome for a cell."""
+        if not self._is_allowed(asset, strategy):
+            return
         key = self._cell_key(asset, strategy)
         cell = self._cells[key]
 
@@ -221,6 +247,8 @@ class StrategyMatrix:
     def record_shadow_trade(self, asset: str, strategy: str, pnl: float,
                             stake: float, outcome: str):
         """Record a hypothetical trade that would have been taken if enabled."""
+        if not self._is_allowed(asset, strategy):
+            return
         key = self._cell_key(asset, strategy)
         cell = self._cells[key]
 
@@ -412,7 +440,10 @@ class StrategyMatrix:
             logger.warning(f"[MATRIX] Failed to persist state: {e}")
 
     def _load_state(self):
-        """Load cell state from disk."""
+        """Load cell state from disk, skipping any (asset, strategy)
+        tuples that are no longer in the whitelist (e.g. deleted
+        strategies or 'unknown' tickers from earlier code paths).
+        """
         if not self.persist_path:
             return
         path = Path(self.persist_path)
@@ -421,8 +452,12 @@ class StrategyMatrix:
         try:
             with open(path) as f:
                 state = json.load(f)
+            skipped = 0
             for key_str, data in state.items():
                 asset, strategy = key_str.split("|", 1)
+                if not self._is_allowed(asset, strategy):
+                    skipped += 1
+                    continue
                 cell = self._cells[self._cell_key(asset, strategy)]
                 cell.enabled = data.get("enabled", False)
                 cell.hard_disabled = data.get("hard_disabled", False)
@@ -444,7 +479,8 @@ class StrategyMatrix:
                 cell.total_shadow_trades = data.get("total_shadow_trades", 0)
                 for d in data.get("disabled_days", []):
                     cell.disabled_days.append(d)
-            logger.info(f"[MATRIX] Loaded state: {len(state)} cells")
+            kept = len(self._cells)
+            logger.info(f"[MATRIX] Loaded state: {kept} cells (skipped {skipped} stale)")
             disabled = sum(1 for c in self._cells.values() if not c.enabled)
             if disabled:
                 logger.info(f"[MATRIX] {disabled} cells currently disabled")
