@@ -78,10 +78,8 @@ def main():
     all_tick_windows = optimize_rr.load_tick_windows(tick_dir)
     print(f"  Loaded {len(all_tick_windows)} tick windows")
 
-    price_dir = next(
-        (p for p in ["data/prices", "/home/jake/workspaces/kalshi-trading-bot/python-bot/data/prices"] if Path(p).exists()),
-        "data/prices",
-    )
+    import data_paths
+    price_dir = str(data_paths.resolve("prices"))
     crypto_prices = optimize_rr.load_crypto_prices(price_dir)
     print(f"  Loaded spot prices for: {sorted(crypto_prices.keys())}")
 

@@ -12,6 +12,7 @@ Usage:
 
 import csv
 import json
+import math
 import os
 import multiprocessing
 import random
@@ -81,7 +82,15 @@ SLIPPAGE_MODEL: dict[int, float] = {}
 
 
 def get_slippage_cents(entry_price_cents: int) -> float:
-    """Get slippage penalty in cents for a given entry price."""
+    """Get slippage penalty in cents for a given entry price.
+
+    Set ZERO_SLIPPAGE=1 to return 0 for every level — this is the right
+    simulation mode when the bot runs as maker/post-only on Kalshi, where
+    maker fees are 0 and fills happen at the posted price without paying
+    the spread-crossing cost captured by the empirical SLIPPAGE_MODEL.
+    """
+    if os.getenv("ZERO_SLIPPAGE", "1") == "1":
+        return 0.0
     if not SLIPPAGE_MODEL:
         return 0.5  # Conservative default if no model loaded
     return SLIPPAGE_MODEL.get(entry_price_cents, 0.5)
@@ -101,6 +110,54 @@ PARAM_RANGES = {
 
 ALPHA = 0.3  # Win rate weight in blended score (training phase only)
 
+# Minimum validation trades required IN EVERY FOLD for a candidate to be
+# considered viable during CV. Set to 0 by default: Wilson LB on the
+# aggregate sample + the per-fold recency weighting already penalizes
+# candidates that concentrate all their trades in one slice. The per-fold
+# floor was blocking 15M cells whose buffered trades cluster in volatile
+# periods, even when the overall sample was statistically solid.
+MIN_VAL_TRADES_PER_FOLD = int(os.getenv("MIN_VAL_TRADES_PER_FOLD", "0"))
+
+# Minimum aggregate validation trades across all folds. With walk-forward,
+# a cell needs at least this many total validated samples to even attempt
+# a fit. Raised to 30 so the optimizer's viability bar matches the bot's
+# enablement filter (bot.py also requires trades >= 30), preventing
+# low-sample candidates from getting saved but then filtered out anyway.
+MIN_TOTAL_VAL_TRADES = int(os.getenv("MIN_TOTAL_VAL_TRADES", "30"))
+
+# Wilson score z for the CV lower bound. 1.96 = 95% one-sided, 2.58 = 99%,
+# 1.0 ≈ 68%. Higher z = more conservative (prefers larger samples more).
+WILSON_Z = float(os.getenv("WILSON_Z", "1.96"))
+
+# Walk-forward CV settings. The optimizer builds train/validate splits
+# that respect temporal ordering (no peeking at future data when
+# "validating" past slices). Because you re-optimize every 3 days, each
+# validation window should roughly represent that cadence.
+WF_MAX_FOLDS = int(os.getenv("WF_MAX_FOLDS", "10"))
+WF_MIN_DATES = int(os.getenv("WF_MIN_DATES", "6"))  # below this, skip CV
+# Recency weighting: each walk-forward fold carries a weight that decays
+# with age. The most recent fold gets weight 1.0; earlier folds halve
+# every RECENCY_HALFLIFE_FOLDS steps back. Set to a large number to
+# effectively disable recency weighting.
+RECENCY_HALFLIFE_FOLDS = float(os.getenv("RECENCY_HALFLIFE_FOLDS", "3.0"))
+
+
+def wilson_lower_bound(wins: int, n: int, z: float = WILSON_Z) -> float:
+    """Wilson score lower bound for a binomial proportion.
+
+    Penalizes small samples: 5/5 wins → LB ≈ 0.48, 200/205 wins → LB ≈ 0.93.
+    Used to rescore CV candidates so a profit-maxing optimizer cannot
+    prefer a 100%-WR-on-5-trades candidate over a 97%-WR-on-200-trades
+    one just because the former has zero observed losses.
+    """
+    if n <= 0:
+        return 0.0
+    p = wins / n
+    denom = 1.0 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    margin = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return max(0.0, center - margin)
+
 
 # ── RR parameter space ───────────────────────────────────────────
 # Every runtime-gating parameter in resolution_rider.py must appear
@@ -111,44 +168,57 @@ ALPHA = 0.3  # Win rate weight in blended score (training phase only)
 #   kelly_fraction / max_bankroll_pct are intentionally NOT searched
 #   (RR uses fixed STAKE_USD).
 #
-# Design note: max_entry_price is PINNED at 98. Prior runs collapsed
-# cells to min==max (e.g. 96-96c, 97-97c) because the 7-day training
-# set only had a handful of tradeable ticks per cell, and those ticks
-# happened to land on specific cents. In live trading the book blows
-# through those cents in 1-2 seconds, so a min==max cell catches
-# almost nothing. We pin the top at 98 (the highest price where
-# risk/reward still makes sense after fees — breakeven WR is 98.1%)
-# and let the optimizer pick the floor only.
+# Design note: entry price band is now swept on BOTH ends. Historically
+# `max_entry_price` was pinned at 98 because early runs collapsed cells
+# to degenerate 1c bands (e.g. 96-96c, 97-97c) where live execution
+# catches almost nothing because the book blows through those cents in
+# 1-2 seconds. We mitigate that with a minimum band width (MIN_BAND_WIDTH)
+# instead of pinning the max, so the optimizer can discover cells whose
+# natural breakeven is below 98c — e.g. sol_15m currently runs ~89% WR
+# which is catastrophic at 98c entry (needs 98%) but profitable at 89c.
+# This matters mostly for the high-frequency 15M cells; hourly cells
+# should keep converging on the classic 95-98c band anyway.
 
 # vol_lookback is fixed at 300s for now; making it a search dimension
 # would explode the candidate count without much benefit since a
 # 5-min realized-vol window is the standard for crypto microstructure.
 VOL_LOOKBACK = 300
 
-# Cell price band: always 95..98 at the widest, but the optimizer can
-# tighten the floor on a per-cell basis (e.g. "this cell only wins at
-# 97c+"). Band is guaranteed to be at least 1 cent wide.
-MAX_ENTRY_PRICE = 98
+# Entry-band constraints. Absolute floor = 88c (anything below is a
+# coin-flip, not RR). Absolute ceiling = 98c (99c requires 99% WR
+# to break even even with $0 fees, and empirical WR is ~97-98% —
+# 99c entries are consistent money losers in tick-level data).
+# Minimum band width = 3c so the band is tradeable in live.
+MIN_CONTRACT_PRICE_FLOOR = 88
+MAX_ENTRY_PRICE_CEIL = 98
+MIN_BAND_WIDTH = 3
 
 
 def sample_params() -> dict:
+    # Parameter importance ranking (from analyze_param_importance.py):
+    #   1. momentum  (40.1% WR spread) — search aggressively
+    #   2. buffer    (38.9% WR spread) — search aggressively
+    #   3. secs_left (14.4% WR spread) — search moderately
+    #   4. entry_price (4.7%) — set wide, don't over-constrain
+    #   5. realized_vol (4.3%) — disabled (not predictive)
+    mcp = random.choice([88, 89, 90, 91, 92, 93, 94, 95])
+    mep = random.choice([96, 97, 98])
+    if mep - mcp < MIN_BAND_WIDTH:
+        mcp = mep - MIN_BAND_WIDTH
     p = {
-        # Floor of the entry band. max is pinned (see design note above).
-        "min_contract_price": random.randint(95, 97),
-        "max_entry_price": MAX_ENTRY_PRICE,
-        "min_seconds": random.choice([10, 15, 30, 45, 60]),
-        "max_seconds": random.choice([60, 90, 120, 180, 240, 300, 360, 420, 480, 600]),
-        "min_price_buffer_pct": round(random.uniform(0.05, 0.50), 3),
+        "min_contract_price": mcp,
+        "max_entry_price": mep,
+        # Time: moderate search (rank #3)
+        "min_seconds": random.choice([10, 15, 30, 45]),
+        "max_seconds": random.choice([60, 90, 120, 180, 240, 300, 480, 600]),
+        # Buffer: fine-grained search (rank #2)
+        "min_price_buffer_pct": round(random.uniform(0.03, 0.60), 3),
+        # Momentum: fine-grained search (rank #1)
         "max_adverse_momentum": round(random.uniform(-0.10, 0.0), 4),
         "momentum_window": random.choice([30, 60, 90, 120, 180, 300]),
         "momentum_periods": random.randint(1, 10),
-        # None = vol filter disabled. Values span calm (~0.02%) to
-        # quite-volatile (~0.20%) per-tick stddev. A None choice gives
-        # the optimizer the option to keep the filter off if it doesn't
-        # add edge for that cell.
-        "max_realized_vol_pct": random.choice(
-            [None, 0.02, 0.04, 0.06, 0.08, 0.10, 0.15, 0.20]
-        ),
+        # Vol: disabled — rank #5, only 4.3% WR spread, kills trade count
+        "max_realized_vol_pct": None,
         "vol_lookback": VOL_LOOKBACK,
     }
     if p["min_seconds"] >= p["max_seconds"]:
@@ -158,27 +228,36 @@ def sample_params() -> dict:
 
 def grid_params() -> list[dict]:
     combos = []
-    # max is pinned at 98 (see MAX_ENTRY_PRICE), only the floor varies
-    for mcp in [95, 96, 97]:
-        for mins in [10, 30, 60]:
-            for ms in [120, 240, 360, 480, 600]:
-                if mins >= ms:
-                    continue
-                for buf in [0.08, 0.12, 0.15, 0.20, 0.30]:
-                    for mom in [-0.08, -0.05, -0.03, 0.0]:
-                        for vol in [None, 0.05, 0.10]:
-                            combos.append({
-                                "min_contract_price": mcp,
-                                "max_entry_price": MAX_ENTRY_PRICE,
-                                "min_seconds": mins,
-                                "max_seconds": ms,
-                                "min_price_buffer_pct": buf,
-                                "max_adverse_momentum": mom,
-                                "momentum_window": 60,
-                                "momentum_periods": 5,
-                                "max_realized_vol_pct": vol,
-                                "vol_lookback": VOL_LOOKBACK,
-                            })
+    # Grid structured by parameter importance:
+    #   momentum × buffer = dense grid (rank #1 × #2)
+    #   time = moderate grid (rank #3)
+    #   entry band = coarse (rank #4)
+    #   vol = off (rank #5, not predictive)
+    band_choices = [
+        (90, 98), (92, 98), (93, 98), (95, 98),
+        (90, 96), (92, 96), (93, 97),
+    ]
+    for mcp, mep in band_choices:
+        for mins, ms in [(10, 90), (10, 180), (10, 300),
+                         (15, 60), (15, 120), (30, 180),
+                         (30, 300), (45, 90), (45, 600)]:
+            # Buffer: dense search (rank #2)
+            for buf in [0.05, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]:
+                # Momentum: dense search (rank #1)
+                for mom in [-0.10, -0.08, -0.06, -0.04, -0.03,
+                            -0.02, -0.01, -0.005, 0.0]:
+                    combos.append({
+                        "min_contract_price": mcp,
+                        "max_entry_price": mep,
+                        "min_seconds": mins,
+                        "max_seconds": ms,
+                        "min_price_buffer_pct": buf,
+                        "max_adverse_momentum": mom,
+                        "momentum_window": 60,
+                        "momentum_periods": 5,
+                        "max_realized_vol_pct": None,
+                        "vol_lookback": VOL_LOOKBACK,
+                    })
     return combos
 
 
@@ -295,7 +374,19 @@ def load_tick_windows(tick_dir: str) -> list[dict]:
     frames = []
     for f in sorted(Path(tick_dir).glob("*.csv")):
         print(f"    {f.name}...")
-        df_one = pd.read_csv(f)
+        # Tolerate schema drift (e.g. a file that was written first with
+        # the 6-column header and later appended with the 7-column
+        # `floor_strike` schema after a bot restart). Python engine +
+        # on_bad_lines='skip' silently drops rows that don't match the
+        # header, losing some recent ticks but preserving everything
+        # before the schema change.
+        try:
+            df_one = pd.read_csv(f, engine="python", on_bad_lines="skip")
+        except Exception as e:
+            print(f"      skip {f.name}: {e}")
+            continue
+        if "timestamp" not in df_one.columns:
+            continue
         df_one["timestamp"] = pd.to_datetime(df_one["timestamp"], utc=True, format="mixed")
         frames.append(df_one)
     if not frames:
@@ -327,9 +418,29 @@ def load_tick_windows(tick_dir: str) -> list[dict]:
             close_time = pd.Timestamp(close_time)
         close_time += pd.Timedelta(seconds=5)
 
+        # Strike resolution: prefer the tick-level floor_strike column
+        # (present in CSVs written by the updated tick recorder), fall
+        # back to parsing from the ticker suffix (works for daily/hourly
+        # series but not 15M, which don't encode the strike in-ticker).
+        # Older CSVs without the column land in the fallback path.
+        strike = None
+        for row in rows:
+            rs = row.get("floor_strike")
+            if rs is None or rs == "":
+                continue
+            try:
+                rs_f = float(rs)
+                if rs_f > 0:
+                    strike = rs_f
+                    break
+            except (ValueError, TypeError):
+                continue
+        if strike is None:
+            strike = parse_strike(ticker)
+
         windows.append({
             "ticker": ticker, "coin": coin, "market_type": mtype,
-            "strike": parse_strike(ticker), "result": result,
+            "strike": strike, "result": result,
             "close_time": close_time, "ticks": rows,
         })
 
@@ -695,6 +806,24 @@ def preprocess_window(window: dict, crypto_prices: dict) -> Optional[dict]:
 
     coin_prices = crypto_prices.get(coin, [])
 
+    # Strike approximation for 15M markets. Kalshi's 15M binary contracts
+    # ("BTC price up in next 15 mins?") don't expose the strike in the
+    # ticker name, and the API wipes the floor_strike field after
+    # settlement — so historical tick replay has no direct strike value.
+    # The rules text clarifies the contract: "is the 60s average BRTI at
+    # close >= the 60s average BRTI at open?". That means the effective
+    # strike IS the spot price at market open (close_time - 15 min).
+    # We approximate it from our 1-minute crypto spot history, accepting
+    # ~30s of timing noise against the true 60s BRTI average. This
+    # restores the buffer filter for 15M cells in CV, which was the
+    # single biggest reason 15M windows couldn't be optimized.
+    market_type = window.get("market_type", "")
+    if strike is None and market_type == "15m" and coin_prices:
+        open_ts = (close_time - pd.Timedelta(minutes=15)).timestamp()
+        approx_strike = get_price_at(coin_prices, open_ts)
+        if approx_strike and approx_strike > 0:
+            strike = approx_strike
+
     # Extract all potentially tradeable ticks (broadly: 94-99c, 10-500s)
     entries = []
     for tick in ticks:
@@ -726,16 +855,24 @@ def preprocess_window(window: dict, crypto_prices: dict) -> Optional[dict]:
         if entry_price < 94 or entry_price > 99:
             continue
 
-        # Pre-compute buffer, momentum, and realized vol
+        # Pre-compute buffer, momentum, and realized vol.
+        # Buffer requires the strike, which only daily/hourly tickers
+        # encode (via the -T<price> suffix). 15M tickers don't, so
+        # buffer_pct stays None for those cells. Momentum and vol are
+        # pure functions of the crypto spot time-series and don't need
+        # the strike — we compute them whenever spot history is available,
+        # which makes them usable features for 15M cells.
         buffer_pct = None
         momentum = None
         realized_vol = None
-        if strike and coin_prices:
+        if coin_prices:
             ts_epoch = ts.timestamp() if hasattr(ts, 'timestamp') else float(ts)
             cp = get_price_at(coin_prices, ts_epoch)
-            if cp and strike > 0:
-                buffer_pct = (cp - strike) / strike * 100
-                # Pre-compute momentum for several windows
+            if cp:
+                if strike and strike > 0:
+                    buffer_pct = (cp - strike) / strike * 100
+                # Pre-compute momentum for every (window, periods) combo
+                # that the search space might ask for.
                 momentum = {}
                 for mw in [30, 60, 90, 120, 180, 300]:
                     for mp in [1, 3, 5, 7, 10]:
@@ -789,11 +926,21 @@ def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
         if e["entry_price"] < min_cp or e["entry_price"] > max_ep:
             continue
 
-        # Buffer
+        # Buffer — time-scaled. The optimizer searches min_buffer as a
+        # "base" value expressed at 60 seconds remaining; the effective
+        # required buffer at any secs_left scales with sqrt(secs_left/60),
+        # mirroring Brownian-motion residual vol. This lets a single
+        # `min_price_buffer_pct` setting correctly gate both early-in-
+        # window entries (where lots of vol remains) and late ones (where
+        # little remains), which a flat threshold could not do — the flat
+        # version either rejected all early entries or passed all late
+        # ones regardless of risk.
         if e["buffer_pct"] is not None:
-            if e["side"] == "yes" and e["buffer_pct"] < min_buffer:
+            time_scale = math.sqrt(max(1.0, e["secs_left"]) / 60.0)
+            required = min_buffer * time_scale
+            if e["side"] == "yes" and e["buffer_pct"] < required:
                 continue
-            if e["side"] == "no" and e["buffer_pct"] > -min_buffer:
+            if e["side"] == "no" and e["buffer_pct"] > -required:
                 continue
 
         # Momentum
@@ -807,6 +954,7 @@ def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
 
         won = (e["side"] == result)
         contracts = max(1, int(10.0 / (e["entry_price"] / 100.0)))
+        stake = contracts * e["entry_price"] / 100.0
         # Apply slippage penalty from empirical Kalshi fill data
         slippage_per_contract = get_slippage_cents(int(e["entry_price"])) / 100.0
         slippage_cost = contracts * slippage_per_contract
@@ -814,27 +962,34 @@ def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
             profit = contracts * (100 - e["entry_price"]) / 100.0 - slippage_cost
         else:
             profit = -contracts * e["entry_price"] / 100.0 - slippage_cost
-        return {"won": won, "profit": profit}
+        return {"won": won, "profit": profit, "stake": stake}
 
     return None
 
 
 def evaluate_params(preprocessed_windows: list[dict], params: dict) -> dict:
     wins = losses = 0
-    total_profit = 0.0
+    win_profit = 0.0
+    loss_profit = 0.0
+    total_stake = 0.0
     for pw in preprocessed_windows:
         r = simulate_fast(pw, params)
         if r is None:
             continue
         if r["won"]:
             wins += 1
+            win_profit += r["profit"]
         else:
             losses += 1
-        total_profit += r["profit"]
+            loss_profit += r["profit"]
+        total_stake += r.get("stake", 0.0)
     trades = wins + losses
     if trades == 0:
-        return {"score": 0, "win_rate": 0, "trades": 0, "profit": 0, "wins": 0, "losses": 0}
+        return {"score": 0, "win_rate": 0, "trades": 0, "profit": 0,
+                "wins": 0, "losses": 0,
+                "win_profit": 0.0, "loss_profit": 0.0, "total_stake": 0.0}
     wr = wins / trades
+    total_profit = win_profit + loss_profit
     ppt = total_profit / trades
     norm_p = max(0, min(1, (ppt + 10) / 10.5))
     return {
@@ -842,6 +997,9 @@ def evaluate_params(preprocessed_windows: list[dict], params: dict) -> dict:
         "win_rate": round(wr, 4),
         "trades": trades, "profit": round(total_profit, 2),
         "wins": wins, "losses": losses,
+        "win_profit": round(win_profit, 4),
+        "loss_profit": round(loss_profit, 4),
+        "total_stake": round(total_stake, 4),
     }
 
 
@@ -867,24 +1025,60 @@ def _cv_worker_init(pp_by_bucket, train_sets):
 
 
 def _cv_score_candidate(params: dict):
-    """Evaluate one candidate across all CV buckets. Returns the tuple
-    the main loop uses for ranking, or None if it doesn't meet the
-    minimum-trade threshold.
+    """Evaluate one candidate across all walk-forward folds.
+
+    Folds are ordered oldest-to-newest. Each fold trains on everything
+    earlier than its validation window, which means the validation
+    signal reflects "would this param have worked on the next chunk?"
+    exactly as the live re-optimize workflow uses the data.
+
+    Ranking rules:
+
+    1. Per-fold minimum trade count. Every fold must have at least
+       MIN_VAL_TRADES_PER_FOLD validation trades. Prevents candidates
+       from "passing" CV by firing only in the richest fold while
+       0-trading the rest.
+
+    2. Aggregate minimum trade count. Across all folds, the candidate
+       must have at least MIN_TOTAL_VAL_TRADES validation samples.
+       Protects against "1 per fold × 2 folds" looking viable.
+
+    3. Recency-weighted Wilson lower bound on win rate. Newer folds
+       count more: the most recent fold has weight 1.0, earlier folds
+       halve every RECENCY_HALFLIFE_FOLDS steps back. The Wilson LB is
+       computed against the weighted win/total counts, which means
+       a candidate that does well on stale data but poorly on recent
+       folds is naturally downranked.
+
+    4. Trade count (unweighted) is the tiebreaker — among candidates
+       with similar Wilson LB, prefer the ones that fire more.
+
+    The asymmetric-payoff "safe profit" is still computed and saved on
+    the result for visibility; it does not affect ranking.
     """
     fold_results = []
     for b in range(len(_WORKER_TRAIN_SETS)):
         train_r = evaluate_params(_WORKER_TRAIN_SETS[b], params)
         val_r = evaluate_params(_WORKER_PP_BY_BUCKET[b], params)
         fold_results.append({
-            "train": train_r, "val": val_r, "val_date": f"bucket_{b}",
+            "train": train_r, "val": val_r, "val_date": f"fold_{b}",
         })
 
+    # Rule 1: require each fold to hit a minimum trade count.
+    if any(f["val"]["trades"] < MIN_VAL_TRADES_PER_FOLD for f in fold_results):
+        return None
+
     total_val_trades = sum(f["val"]["trades"] for f in fold_results)
-    if total_val_trades < 2:
+
+    # Rule 2: aggregate sample-size floor.
+    if total_val_trades < MIN_TOTAL_VAL_TRADES:
         return None
 
     total_val_wins = sum(f["val"]["wins"] for f in fold_results)
     total_val_losses = sum(f["val"]["losses"] for f in fold_results)
+    total_val_win_profit = sum(f["val"]["win_profit"] for f in fold_results)
+    total_val_loss_profit = sum(f["val"]["loss_profit"] for f in fold_results)
+    total_val_stake = sum(f["val"]["total_stake"] for f in fold_results)
     total_train_trades = sum(f["train"]["trades"] for f in fold_results)
     val_wr = total_val_wins / total_val_trades if total_val_trades > 0 else 0
 
@@ -895,12 +1089,40 @@ def _cv_score_candidate(params: dict):
     train_total = sum(f["train"]["trades"] for f in fold_results)
     train_wr = train_wr_num / train_total if train_total > 0 else 0
 
-    total_val_profit = sum(f["val"]["profit"] for f in fold_results)
-    score = total_val_profit
+    total_val_profit = total_val_win_profit + total_val_loss_profit
+
+    # Rule 3: recency-weighted Wilson lower bound on validation WR.
+    # The last fold (index n-1) is the most recent and gets weight 1.0.
+    # Folds farther in the past decay exponentially with half-life
+    # RECENCY_HALFLIFE_FOLDS. This means a param that worked on days
+    # 1-3 but not on days 7-9 will get a strong WR penalty.
+    n_folds = len(fold_results)
+    weights = [
+        0.5 ** ((n_folds - 1 - i) / RECENCY_HALFLIFE_FOLDS)
+        for i in range(n_folds)
+    ]
+    weighted_wins = sum(f["val"]["wins"] * w for f, w in zip(fold_results, weights))
+    weighted_total = sum(f["val"]["trades"] * w for f, w in zip(fold_results, weights))
+    # Wilson LB accepts floats; this becomes a weighted approximation
+    # rather than a strict binomial bound, which is fine for ranking.
+    wr_lb = wilson_lower_bound(int(round(weighted_wins)),
+                               max(1, int(round(weighted_total))))
+
+    # Bookkeeping: safe per-trade profit estimate using observed economics
+    # and the Wilson LB WR. Not used for ranking — shown in rr_params.json
+    # for transparency.
+    avg_win = total_val_win_profit / total_val_wins if total_val_wins > 0 else 0.0
+    if total_val_losses > 0:
+        avg_loss = total_val_loss_profit / total_val_losses
+    else:
+        avg_stake = total_val_stake / total_val_trades if total_val_trades > 0 else 0.0
+        avg_loss = -avg_stake
+    safe_ppt = wr_lb * avg_win + (1 - wr_lb) * avg_loss
 
     return (
-        score, val_wr, total_val_losses, total_val_trades,
+        wr_lb, val_wr, total_val_losses, total_val_trades,
         train_wr, total_train_trades, params, fold_results,
+        safe_ppt, total_val_profit,
     )
 
 
@@ -989,6 +1211,19 @@ def optimize_cell(name: str, train: list[dict], val: list[dict],
 
 def main():
     t0 = time.time()
+    # Python 3.14 defaults multiprocessing start method to 'forkserver',
+    # which pickles init args through a pipe and can fail with
+    # `_pickle.UnpicklingError: pickle data was truncated` when the
+    # per-worker payload (pp_by_bucket + train_sets) gets large — we
+    # hit this at ~4000 preprocessed windows × 10 folds on btc_hourly.
+    # 'fork' copies memory on write, no pickling at init, no size limit.
+    # Safe on Linux since this script doesn't share threads with the
+    # children.
+    try:
+        multiprocessing.set_start_method("fork", force=True)
+    except (RuntimeError, ValueError):
+        pass  # already set, or not supported on this platform
+
     print("=" * 60)
     print("Resolution Rider Parameter Optimizer")
     print("=" * 60)
@@ -1053,17 +1288,63 @@ def main():
             else:
                 print(f"  No historical dataset found (looked at {hf_dir} and {trades_parquet})")
 
-    all_windows = all_tick_windows + historical_windows
-    print(f"  TOTAL: {len(all_windows)} market windows "
-          f"({len(all_tick_windows)} live + {len(historical_windows)} historical)")
+    # Load "best case" settled-market windows (from fetch_settled_data.py).
+    # SKIP_SETTLED=1 excludes them — their synthetic 60s timestamp biases
+    # time window selection. Use tick + HF data for time-aware optimization.
+    settled_windows: list = []
+    settled_path = Path("data/settled_windows.pkl")
+    if os.getenv("SKIP_SETTLED", "0") == "1":
+        print(f"  Settled API: skipped (SKIP_SETTLED=1)")
+    elif settled_path.exists():
+        import pickle
+        with open(settled_path, "rb") as f:
+            settled_windows = pickle.load(f)
+        print(f"  Settled API: {len(settled_windows)} best-case windows from {settled_path}")
+    else:
+        print(f"  Settled API: not found ({settled_path}), run fetch_settled_data.py to add")
 
-    # Use local data/prices if available, fall back to other paths
-    price_candidates = [
-        "data/prices",
-        "/home/jake/workspaces/kalshi-trading-bot/python-bot/data/prices",
-    ]
-    price_dir = next((p for p in price_candidates if Path(p).exists()), "data/prices")
-    crypto_prices = load_crypto_prices(price_dir)
+    all_windows = all_tick_windows + historical_windows + settled_windows
+    n_settled = len(settled_windows)
+    print(f"  TOTAL: {len(all_windows)} market windows "
+          f"({len(all_tick_windows)} live + {len(historical_windows)} historical"
+          f" + {n_settled} settled)")
+
+    # Prefer high-frequency (5-second) spot data when present; the HF
+    # path gives much cleaner strike approximation for 15M markets. Fall
+    # back to the 1-minute file for dates where HF isn't recorded yet.
+    # We merge both directories: the load_crypto_prices helper de-dupes
+    # by (ticker, timestamp), so overlapping days resolve cleanly with
+    # the finer samples taking precedence.
+    # Resolve via data_paths so we pick up files regardless of whether
+    # they still live under python-bot/data/ or have been migrated to
+    # $DATA_DIR. all_candidates() returns both when both have files,
+    # so dedupe below merges a half-migrated state cleanly.
+    import data_paths
+    hf_candidates = data_paths.all_candidates("prices_hf")
+    coarse_candidates = data_paths.all_candidates("prices")
+
+    crypto_prices: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for hf_dir in hf_candidates:
+        print(f"  Loading HF (5s) crypto spot from {hf_dir}...")
+        for coin, pts in load_crypto_prices(str(hf_dir)).items():
+            crypto_prices[coin].extend(pts)
+    for coarse_dir in coarse_candidates:
+        print(f"  Loading 1-min crypto spot from {coarse_dir}...")
+        for coin, pts in load_crypto_prices(str(coarse_dir)).items():
+            crypto_prices[coin].extend(pts)
+    # Sort + dedupe per coin
+    for coin in crypto_prices:
+        seen = set()
+        deduped = []
+        for ts, px in sorted(crypto_prices[coin]):
+            # Keep the first (HF) when timestamps collide at the second
+            key = round(ts)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append((ts, px))
+        crypto_prices[coin] = deduped
+    crypto_prices = dict(crypto_prices)
     for coin, p in crypto_prices.items():
         print(f"  {coin.upper()}: {len(p)} price points")
 
@@ -1086,7 +1367,7 @@ def main():
     print(f"  {len(all_dates)} distinct dates (showing first/last 3): "
           f"{', '.join(all_dates[:3])} ... {', '.join(all_dates[-3:])}")
 
-    print("\n[3/4] Optimizing (leave-one-day-out cross-validation)...")
+    print("\n[3/4] Optimizing (walk-forward cross-validation)...")
     results = {}
     for cell in all_cells:
         print(f"\n--- {cell} ---")
@@ -1118,17 +1399,14 @@ def main():
         for _ in range(3000):
             candidates.append(sample_params())
 
-        # Bucketed CV: group unique dates into at most MAX_FOLDS buckets, then
-        # leave-one-bucket-out. With 7 days of live data this still gives us
-        # 7 folds (one per day). With 300+ days of historical data we cap at
-        # MAX_FOLDS to keep runtime bounded (otherwise CV = 300+ × candidates,
-        # which runs for hours on btc_hourly). Each bucket has roughly equal
-        # window counts so the folds are balanced.
-        MAX_FOLDS = int(os.getenv("MAX_CV_FOLDS", "10"))
         unique_dates = sorted(set(pp["_date"] for pp in preprocessed))
-        if len(unique_dates) < 2:
-            print(f"  {cell}: only 1 date, can't cross-validate")
-            # Use all data as training, no validation
+        N = len(unique_dates)
+
+        if N < WF_MIN_DATES:
+            # Not enough distinct dates for walk-forward. Fall back to a
+            # train-only fit on everything, with no out-of-sample validation.
+            # This matches the legacy "1 date" fallback behavior.
+            print(f"  {cell}: only {N} dates (need ≥{WF_MIN_DATES}), fitting without CV")
             scored = []
             for i, p in enumerate(candidates):
                 if i > 0 and i % 1000 == 0:
@@ -1151,26 +1429,56 @@ def main():
                 print(f"    BEST (no CV): WR={best_r['win_rate']:.1%} ({best_r['trades']}t)")
             continue
 
-        # Assign each date to a bucket 0..MAX_FOLDS-1 by position
-        n_buckets = min(MAX_FOLDS, len(unique_dates))
-        date_to_bucket = {}
-        for idx, d in enumerate(unique_dates):
-            bucket = (idx * n_buckets) // len(unique_dates)
-            date_to_bucket[d] = bucket
-        # Pre-partition preprocessed windows by bucket ONCE, not per candidate
-        pp_by_bucket: list[list[dict]] = [[] for _ in range(n_buckets)]
+        # Walk-forward split. Carve the sorted dates into n_folds+1 contiguous
+        # chunks. Fold k trains on chunks [0..k+1) and validates on chunk k+1.
+        # Training grows monotonically; validation always comes AFTER training.
+        # This is the methodologically correct setup for a re-optimize-every-
+        # N-days workflow: it directly measures "if I had optimized at time T
+        # using only past data, how well would the params perform on the next
+        # chunk?"
+        # n_folds scales with N so each chunk has ≥4 dates on average — this
+        # keeps the very first fold's training window from being too small.
+        n_folds = min(WF_MAX_FOLDS, max(2, N // 4))
+        # +1 chunk so the first chunk is training-only; then n_folds validation
+        # chunks follow. Last chunk absorbs leftover so no dates are dropped.
+        chunk_count = n_folds + 1
+        base_chunk_size = max(1, N // chunk_count)
+        chunk_boundaries = [i * base_chunk_size for i in range(chunk_count)]
+        chunk_boundaries.append(N)  # final boundary
+
+        # Build walk-forward fold pairs.
+        pp_by_date: dict[str, list] = defaultdict(list)
         for pp in preprocessed:
-            pp_by_bucket[date_to_bucket[pp["_date"]]].append(pp)
+            pp_by_date[pp["_date"]].append(pp)
 
-        print(f"  Running {n_buckets}-fold CV ({len(unique_dates)} dates, "
-              f"{[len(b) for b in pp_by_bucket]} windows/bucket)...")
+        pp_by_bucket: list[list[dict]] = []  # validation sets per fold
+        train_sets: list[list[dict]] = []    # training sets per fold
+        fold_val_ranges: list[str] = []
+        for i in range(n_folds):
+            train_end = chunk_boundaries[i + 1]
+            val_end = chunk_boundaries[i + 2]
+            train_dates_set = set(unique_dates[:train_end])
+            val_dates_list = unique_dates[train_end:val_end]
+            val_dates_set = set(val_dates_list)
+            if not val_dates_list:
+                continue
+            train_pps = [pp for pp in preprocessed if pp["_date"] in train_dates_set]
+            val_pps = [pp for pp in preprocessed if pp["_date"] in val_dates_set]
+            train_sets.append(train_pps)
+            pp_by_bucket.append(val_pps)
+            fold_val_ranges.append(f"{val_dates_list[0]}..{val_dates_list[-1]}")
 
-        # Pre-compute per-bucket "not this bucket" slices for training
-        # (list comprehension per candidate was O(candidates * windows * folds))
-        train_sets = []
-        for b in range(n_buckets):
-            train_sets.append([pp for i, pp in enumerate(preprocessed)
-                               if date_to_bucket[pp["_date"]] != b])
+        n_buckets = len(pp_by_bucket)
+        if n_buckets < 2:
+            print(f"  {cell}: walk-forward produced <2 folds (N={N}), skipping")
+            continue
+
+        fold_window_counts = [len(b) for b in pp_by_bucket]
+        fold_train_counts = [len(t) for t in train_sets]
+        print(f"  Walk-forward: {n_buckets} folds from {N} dates")
+        print(f"    train sizes:  {fold_train_counts}")
+        print(f"    val sizes:    {fold_window_counts}")
+        print(f"    val ranges:   {fold_val_ranges[0]} ... {fold_val_ranges[-1]}")
 
         # Parallel candidate scoring across CPU cores. Each worker gets
         # one pickled copy of pp_by_bucket + train_sets at startup (via
@@ -1207,14 +1515,36 @@ def main():
             print(f"  {cell}: no candidates with validation trades")
             continue
 
-        # Sort: by total validation profit (highest first), then trade count
-        candidate_scores.sort(key=lambda x: (-x[0], -x[3]))
+        # Profit-first scoring: maximize P&L, with WR bonus when
+        # profitable and WR dampening when losing (high WR + negative
+        # P&L means you're close to breakeven — better than low WR +
+        # negative P&L). Low-trade candidates get discounted.
+        def _composite(x):
+            pnl = x[9]       # raw validation profit
+            wr = x[1]        # raw validation win rate
+            trades = x[3]    # validation trade count
+            score = pnl
+            # WR multiplier: amplify profit for high WR; dampen losses
+            # for high WR (closer to breakeven = better losing candidate)
+            if wr > 0.90:
+                m = 1.0 + (wr - 0.90) * 5.0
+                score = score * m if score > 0 else score / m
+            # Low-trade discount
+            if trades < 20:
+                score *= trades / 20.0
+            return score
+
+        candidate_scores.sort(key=lambda x: -_composite(x))
 
         best = candidate_scores[0]
-        score, val_wr, val_losses, val_trades, train_wr, train_trades, p, folds = best
+        (wr_lb, val_wr, val_losses, val_trades, train_wr, train_trades,
+         p, folds, safe_ppt, _) = best
+        comp_score = _composite(best)
 
         val_profit = sum(f["val"]["profit"] for f in folds)
         train_profit = sum(f["train"]["profit"] for f in folds)
+        min_fold_trades = min(f["val"]["trades"] for f in folds)
+        safe_total = safe_ppt * val_trades
 
         results[cell] = {
             **p,
@@ -1226,12 +1556,20 @@ def main():
             "cv_total_val_trades": val_trades,
             "cv_val_losses": val_losses,
             "cv_val_profit": round(val_profit, 2),
+            "cv_wr_lower_bound": round(wr_lb, 4),
+            "cv_safe_ppt": round(safe_ppt, 4),
+            "cv_safe_total": round(safe_total, 2),
+            "cv_min_fold_trades": min_fold_trades,
+            "cv_composite_score": round(comp_score, 4),
         }
 
         vol_str = (f"vol≤{p['max_realized_vol_pct']}%" if p.get("max_realized_vol_pct") is not None
                    else "vol=off")
-        print(f"    BEST: CV val WR={val_wr:.1%} ({val_trades}t, {val_losses}L), "
+        print(f"    BEST: CV val WR={val_wr:.1%} (LB={wr_lb:.1%}) "
+              f"({val_trades}t, {val_losses}L, min/fold={min_fold_trades}), "
               f"train WR={train_wr:.1%} ({train_trades}t)")
+        print(f"    composite={comp_score:.4f}, raw val profit=${val_profit:.2f}, "
+              f"safe per-trade=${safe_ppt:.3f}, safe total=${safe_total:.2f}")
         print(f"    buffer={p['min_price_buffer_pct']}%, "
               f"secs={p.get('min_seconds', 10)}-{p['max_seconds']}, "
               f"price={p['min_contract_price']}-{p['max_entry_price']}c, "

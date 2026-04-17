@@ -154,7 +154,10 @@ class MarketScanner:
                 continue
             yes_mid = (yes_bid + yes_ask) / 2
             fav_price = max(yes_mid, 100 - yes_mid)
-            if 95 <= fav_price <= 99:
+            # Include anything from 85c+ so per-cell params (which can
+            # go as low as 89c) aren't filtered out before the fast-RR
+            # scanner gets to apply its own cell-specific thresholds.
+            if 85 <= fav_price <= 99:
                 edge = 100 - fav_price
                 candidates.append((edge, secs_left, m))
 

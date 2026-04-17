@@ -26,6 +26,24 @@ from typing import Optional
 from strategies.base import Signal, Strategy, TradeRecommendation
 
 
+def required_buffer(base_pct: float, secs_left: float) -> float:
+    """Time-scale the base buffer requirement by sqrt(secs_left / 60).
+
+    Rationale: for a Brownian-motion price process, the residual σ at
+    time t is proportional to sqrt(t). A safe buffer at 60s remaining
+    should be ~2× larger at 240s and ~half that at 15s. Encoding this
+    lets the optimizer search a single `base_pct` value that correctly
+    gates entries across the full time range of a cell, rather than
+    picking a flat threshold that's either too strict late or too loose
+    early.
+
+    This is the same transform applied by optimize_rr.simulate_fast, so
+    live and training stay in lock-step.
+    """
+    scaled = math.sqrt(max(1.0, secs_left) / 60.0)
+    return base_pct * scaled
+
+
 class ResolutionRiderStrategy(Strategy):
     """
     High-probability grind: buys only when a contract is 95-99c.
@@ -164,10 +182,14 @@ class ResolutionRiderStrategy(Strategy):
                 no_trade.reason = f"YES ask {our_price}c below minimum {min_cp}c"
                 return no_trade
 
-            # For YES (price above strike), buffer must be positive and large enough
-            if buffer_pct is not None and buffer_pct < min_buf:
+            # For YES (price above strike), buffer must be positive and
+            # larger than the time-scaled requirement. The base
+            # `min_buf` is the threshold at 60s remaining; it scales up
+            # at longer horizons and down at shorter ones.
+            req = required_buffer(min_buf, secs_left)
+            if buffer_pct is not None and buffer_pct < req:
                 no_trade.reason = (f"YES@{our_price}c but price only {buffer_pct:+.2f}% "
-                                   f"from strike (need +{min_buf}%)")
+                                   f"from strike (need +{req:.3f}% @ {secs_left:.0f}s)")
                 return no_trade
 
             # Adverse momentum: for YES we need price rising (or at least
@@ -204,10 +226,12 @@ class ResolutionRiderStrategy(Strategy):
                 no_trade.reason = f"NO price {our_price}c below minimum {min_cp}c"
                 return no_trade
 
-            # For NO (price below strike), buffer must be negative and large enough
-            if buffer_pct is not None and buffer_pct > -min_buf:
+            # For NO (price below strike), buffer must be negative and
+            # below the negated time-scaled requirement.
+            req = required_buffer(min_buf, secs_left)
+            if buffer_pct is not None and buffer_pct > -req:
                 no_trade.reason = (f"NO@{our_price}c but price only {buffer_pct:+.2f}% "
-                                   f"from strike (need -{min_buf}%)")
+                                   f"from strike (need -{req:.3f}% @ {secs_left:.0f}s)")
                 return no_trade
 
             # Adverse momentum: for NO we need price falling (or at least

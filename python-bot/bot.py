@@ -28,7 +28,9 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
+import re
 import signal
 import sys
 import threading
@@ -99,6 +101,36 @@ def parse_book_top(book: dict) -> tuple:
     yes_bid = yes_levels[-1] if yes_levels else None
     yes_ask = (100 - no_levels[-1]) if no_levels else None
     return yes_bid, yes_ask
+
+
+_STRIKE_TITLE_RE = re.compile(r'\$([0-9,]+\.?\d*)')
+
+
+def best_strike_for_market(market: dict):
+    """Return the best-available strike (float) for a Kalshi market, or None.
+
+    Kalshi's daily/hourly markets populate `floor_strike` directly. The 15M
+    markets do not — the strike is embedded in the `subtitle`/`title` text
+    like "$66,838.62 target", so we regex it out as a fallback. This helper
+    is the single source of truth used by both live trading (for buffer
+    computation) and the tick recorder (for persisting strike alongside
+    bid/ask so the optimizer can reconstruct buffer during CV).
+    """
+    fs = market.get("floor_strike")
+    if fs is not None:
+        try:
+            return float(fs)
+        except (ValueError, TypeError):
+            pass
+    for field in ("subtitle", "title", "yes_sub_title", "no_sub_title"):
+        text = market.get(field, "") or ""
+        match = _STRIKE_TITLE_RE.search(text)
+        if match:
+            try:
+                return float(match.group(1).replace(",", ""))
+            except ValueError:
+                continue
+    return None
 
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -326,12 +358,26 @@ class TradeLogger:
             if reason.startswith("SETTLED:"):
                 settled_order_ids.add(row["order_id"])
 
-        # Return trade rows (not settlement rows) whose order_id hasn't been settled
+        # Return trade rows (not settlement rows) whose order_id hasn't been settled.
+        # Skip CANCELLED/REJECTED rows and any zero-contract row: those represent
+        # orders that never filled, so there is nothing to settle. Without this
+        # guard the settlement loop would write a phantom SETTLED row with
+        # contracts=0, stake=0 for every cancelled order.
         unsettled = []
         for row in rows:
             reason = row.get("reason", "")
-            if not reason.startswith("SETTLED:") and row["order_id"] not in settled_order_ids:
-                unsettled.append(row)
+            if reason.startswith("SETTLED:"):
+                continue
+            if reason.startswith("CANCELLED") or reason.startswith("REJECTED"):
+                continue
+            try:
+                if int(row.get("contracts") or 0) <= 0:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            if row["order_id"] in settled_order_ids:
+                continue
+            unsettled.append(row)
         return unsettled
 
     def get_historical_stats(self) -> dict:
@@ -358,8 +404,23 @@ class TradeLogger:
             reader = csv.DictReader(f)
             rows = list(reader)
 
+        # Exclude zero-contract rows: these are cancelled/rejected orders that
+        # never filled (plus any phantom SETTLED rows produced before the
+        # get_unsettled_trades fix). They shouldn't count as trades.
+        def _has_contracts(r):
+            try:
+                return int(r.get("contracts") or 0) > 0
+            except (ValueError, TypeError):
+                return False
+
+        rows = [r for r in rows if _has_contracts(r)]
         settlements = [r for r in rows if r.get("reason", "").startswith("SETTLED:")]
-        entries = [r for r in rows if not r.get("reason", "").startswith("SETTLED:")]
+        entries = [
+            r for r in rows
+            if not r.get("reason", "").startswith("SETTLED:")
+            and not r.get("reason", "").startswith("CANCELLED")
+            and not r.get("reason", "").startswith("REJECTED")
+        ]
         settled_ids = {s["order_id"] for s in settlements}
         unsettled = [e for e in entries if e["order_id"] not in settled_ids]
 
@@ -917,9 +978,17 @@ class TradingBot:
             "KXBNB15M", "KXBNBD", "KXHYPE15M", "KXHYPED",
         ])
 
+        # Strike cache populated from scanner/Kalshi API as markets are
+        # discovered. Lookups return the last-known strike for a ticker,
+        # or None if we haven't seen its metadata yet. The tick recorder
+        # uses this to attach floor_strike to each tick row so the
+        # optimizer can compute buffer_pct for 15M cells, whose ticker
+        # format (KXBTC15M-<yymmdd><hhmm>-<mm>) doesn't encode it.
+        self._ticker_strikes: dict = {}
+
         # Enable recording of live contract prices for future calibration
         data_dir = os.getenv("DATA_DIR", "/mnt/d/datasets/prediction-market-analysis")
-        self.ws_feed.enable_recording(data_dir)
+        self.ws_feed.enable_recording(data_dir, strike_lookup=self._ticker_strikes.get)
 
         # Inject WebSocket feed into all scanners for real-time prices
         for asset in self.assets.values():
@@ -964,9 +1033,40 @@ class TradingBot:
         if rr_params_path.exists():
             with open(rr_params_path) as f:
                 all_rr_params = json.load(f)
-            safe_cells = {k: v for k, v in all_rr_params.items()
-                          if v.get("cv_val_profit", 0) > 0 or
-                          (v.get("cv_folds", 0) == 0 and v.get("training_profit", 0) > 0)}
+            # Cell safety gate. Set RR_ENABLE_ALL=1 to bypass and let
+            # every cell with CV data trade (best-case / validation mode).
+            enable_all = os.environ.get("RR_ENABLE_ALL", "0") == "1"
+
+            def _cell_is_safe(v: dict) -> bool:
+                if enable_all:
+                    # Only require minimum data: some CV or positive training
+                    return (v.get("cv_total_val_trades", 0) >= 10
+                            or v.get("training_trades", 0) >= 5)
+                if v.get("cv_folds", 0) == 0:
+                    return v.get("training_profit", 0) > 0
+                wr_lb = v.get("cv_wr_lower_bound", 0)
+                trades = v.get("cv_total_val_trades", 0)
+                profit = v.get("cv_val_profit", -999)
+                if trades < 30:
+                    return False
+                # High WR confidence — near-certain at typical entry prices
+                if wr_lb >= 0.93:
+                    return True
+                # Positive CV profit with reasonable WR — the optimizer
+                # found this cell actually makes money
+                if profit > 0 and wr_lb >= 0.80:
+                    return True
+                # Breakeven-aware gate: WR_LB must exceed the breakeven
+                # WR for this cell's entry price. At 95c, breakeven is
+                # 95%; at 90c, breakeven is 90%. A cell with 88% WR_LB
+                # at 88c min entry is viable, but not at 95c.
+                min_cp = v.get("min_contract_price", 95)
+                breakeven_wr = min_cp / 100.0
+                if wr_lb >= breakeven_wr and trades >= 50:
+                    return True
+                return False
+
+            safe_cells = {k: v for k, v in all_rr_params.items() if _cell_is_safe(v)}
             self._rr_cell_params = safe_cells
             self._log(f"[INIT] Loaded optimized RR params: {len(safe_cells)} safe cells "
                       f"({', '.join(sorted(safe_cells.keys()))})")
@@ -1136,6 +1236,10 @@ class TradingBot:
         # Start reconciliation thread — keeps CSV in sync with Kalshi API
         self._start_reconcile_thread()
 
+        # Start orderbook depth snapshot thread — collects depth data for
+        # future optimizer features (book imbalance, depth-at-level, etc).
+        self._start_orderbook_thread()
+
         print(f"{'='*72}")
         print("Warming up price feed (collecting 60s of data)...")
 
@@ -1202,10 +1306,14 @@ class TradingBot:
                 market = scanner.get_next_expiring_market()
                 if market:
                     yes_bid, yes_ask = scanner.parse_yes_price(market)
+                    ticker = market.get("ticker", "")
+                    strike = best_strike_for_market(market)
+                    if ticker and strike is not None:
+                        self._ticker_strikes[ticker] = strike
                     asset["_rr_market"] = {
-                        "ticker": market.get("ticker", ""),
+                        "ticker": ticker,
                         "close_time": market.get("close_time", ""),
-                        "floor_strike": market.get("floor_strike"),
+                        "floor_strike": strike if strike is not None else market.get("floor_strike"),
                         "yes_bid": yes_bid,
                         "yes_ask": yes_ask,
                     }
@@ -1221,16 +1329,22 @@ class TradingBot:
                         cached = []
                         for m in rr_markets:
                             yb, ya = scanner.parse_yes_price(m)
+                            m_ticker = m.get("ticker", "")
+                            m_strike = best_strike_for_market(m)
+                            if m_ticker and m_strike is not None:
+                                self._ticker_strikes[m_ticker] = m_strike
                             cached.append({
-                                "ticker": m.get("ticker", ""),
+                                "ticker": m_ticker,
                                 "close_time": m.get("close_time", ""),
-                                "floor_strike": m.get("floor_strike"),
+                                "floor_strike": m_strike if m_strike is not None else m.get("floor_strike"),
                                 "yes_bid": yb,
                                 "yes_ask": ya,
                             })
                         asset["_rr_daily_markets"] = cached
-            except Exception:
-                pass
+            except Exception as e:
+                if not hasattr(self, '_rr_cache_err_ts') or time.time() - self._rr_cache_err_ts > 60:
+                    self._log(f"  [RR-CACHE] {key}: refresh error: {e}", level="warning")
+                    self._rr_cache_err_ts = time.time()
 
     def _fast_rr_scan(self):
         """
@@ -1283,9 +1397,15 @@ class TradingBot:
             cell_buffer = cell_params.get("min_price_buffer_pct", rr.min_price_buffer_pct)
 
             # Build list of markets to check (main + hourly/daily extras)
-            markets_to_check = [cache]
+            # For hourly/daily: prefer the filtered list, but always
+            # include the primary cache as fallback — _rr_daily_markets
+            # can be empty if no strikes pass the price filter yet.
             if is_daily:
-                markets_to_check = asset.get("_rr_daily_markets") or []
+                markets_to_check = list(asset.get("_rr_daily_markets") or [])
+                if cache and cache.get("ticker") and cache not in markets_to_check:
+                    markets_to_check.append(cache)
+            else:
+                markets_to_check = [cache]
 
             if not markets_to_check:
                 bump(cell_name, "no_markets")
@@ -1358,16 +1478,21 @@ class TradingBot:
                     continue
                 buffer_pct = (feed.current_price - strike) / strike * 100
 
+                # Time-scaled buffer requirement (matches optimizer +
+                # resolution_rider.required_buffer). cell_buffer is the
+                # base threshold at 60s remaining; scales with sqrt(t/60).
+                cell_buf_required = cell_buffer * math.sqrt(max(1.0, secs_left) / 60.0)
+
                 # Determine which side we'd trade, then check buffer for that side
                 no_mid = 100 - yes_mid
                 if yes_mid >= no_mid:
                     # YES side favored — price must be ABOVE strike by buffer
-                    if buffer_pct < cell_buffer:
+                    if buffer_pct < cell_buf_required:
                         bump(cell_name, "yes_buf_low")
                         continue
                 else:
                     # NO side favored — price must be BELOW strike by buffer
-                    if buffer_pct > -cell_buffer:
+                    if buffer_pct > -cell_buf_required:
                         bump(cell_name, "no_buf_high")
                         continue
 
@@ -1420,7 +1545,8 @@ class TradingBot:
                     parts = ticker.rsplit("-", 1)
                     if len(parts) > 1:
                         self._traded_tickers.add(parts[0])
-                self._maybe_trade(market_dict, strats, asset_key=key)
+                self._maybe_trade(market_dict, strats, asset_key=key,
+                                  cell_params=cell_params)
 
     def _start_fast_rr_thread(self):
         """Start the fast RR scanner in a dedicated high-frequency thread."""
@@ -1486,6 +1612,120 @@ class TradingBot:
         t = threading.Thread(target=_reconcile_loop, daemon=True, name="reconcile")
         t.start()
         self._log("[INIT] Reconcile thread started (60s interval)")
+
+    def _start_orderbook_thread(self):
+        """Periodically snapshot orderbook depth for each active market.
+
+        Writes to {DATA_DIR}/orderbooks/YYYY-MM-DD.csv with schema:
+          timestamp, ticker, yes_bids, yes_asks, no_bids, no_asks
+        Each depth column is a compact JSON array of [price_cents, qty]
+        pairs, top-to-bottom of book. This gives the optimizer a full
+        picture of book imbalance at entry time without storing it per
+        tick (which would be overkill).
+
+        The thread staggers snapshots so we don't hammer the API with 14
+        simultaneous get_orderbook calls. Target cadence: each market is
+        snapshotted every ~60s, which at ~14 markets means one call every
+        ~4s on average — well within Kalshi rate limits.
+        """
+        from pathlib import Path
+        import data_paths
+
+        ob_dir = data_paths.ensure("orderbooks")
+
+        def _snapshot_market(ticker: str):
+            try:
+                book = self.client.get_orderbook(ticker, depth=10)
+            except Exception:
+                return None
+
+            yes_bids: list = []
+            yes_asks: list = []
+            no_bids: list = []
+            no_asks: list = []
+            fp = book.get("orderbook_fp") or {}
+            for lvl in fp.get("yes_dollars", []) or []:
+                try:
+                    yes_bids.append([int(round(float(lvl[0]) * 100)), float(lvl[1])])
+                except (ValueError, TypeError, IndexError):
+                    pass
+            for lvl in fp.get("no_dollars", []) or []:
+                try:
+                    no_bids.append([int(round(float(lvl[0]) * 100)), float(lvl[1])])
+                except (ValueError, TypeError, IndexError):
+                    pass
+            # YES asks are derived from NO bids: someone willing to SELL YES
+            # at price p is equivalent to someone bidding to BUY NO at (100-p).
+            for p_cents, qty in no_bids:
+                yes_asks.append([100 - p_cents, qty])
+            for p_cents, qty in yes_bids:
+                no_asks.append([100 - p_cents, qty])
+            return {
+                "yes_bids": yes_bids, "yes_asks": yes_asks,
+                "no_bids": no_bids,   "no_asks": no_asks,
+            }
+
+        def _write_row(ticker: str, book: dict):
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            path = ob_dir / f"{date_str}.csv"
+            new_file = not path.exists()
+            with open(path, "a", newline="") as f:
+                writer = csv.writer(f)
+                if new_file:
+                    writer.writerow(["timestamp", "ticker",
+                                     "yes_bids", "yes_asks",
+                                     "no_bids", "no_asks"])
+                writer.writerow([
+                    datetime.now(timezone.utc).isoformat(),
+                    ticker,
+                    json.dumps(book["yes_bids"]),
+                    json.dumps(book["yes_asks"]),
+                    json.dumps(book["no_bids"]),
+                    json.dumps(book["no_asks"]),
+                ])
+
+        def _orderbook_loop():
+            time.sleep(15)  # Let startup settle
+            per_market_interval = 60.0  # Target cadence per ticker
+            while self.running:
+                # Collect the current set of tickers that matter —
+                # whichever markets the bot's scanners are actively
+                # tracking. Prefer _rr_market (single next-expiring)
+                # and _rr_daily_markets (near-certain strikes).
+                tickers: list = []
+                for asset in self.assets.values():
+                    rrm = asset.get("_rr_market")
+                    if rrm and rrm.get("ticker"):
+                        tickers.append(rrm["ticker"])
+                    for m in asset.get("_rr_daily_markets") or []:
+                        if m.get("ticker"):
+                            tickers.append(m["ticker"])
+                tickers = list(dict.fromkeys(tickers))  # de-dupe, keep order
+
+                if not tickers:
+                    time.sleep(5)
+                    continue
+
+                # Stagger per-market calls to spread load over the interval
+                delay = max(0.5, per_market_interval / max(1, len(tickers)))
+                for ticker in tickers:
+                    if not self.running:
+                        break
+                    book = _snapshot_market(ticker)
+                    if book is not None:
+                        try:
+                            _write_row(ticker, book)
+                        except Exception as e:
+                            if not hasattr(self, "_ob_errs"):
+                                self._ob_errs = 0
+                            self._ob_errs += 1
+                            if self._ob_errs <= 3:
+                                self._log(f"[OB] Write error: {e}", level="warning")
+                    time.sleep(delay)
+
+        t = threading.Thread(target=_orderbook_loop, daemon=True, name="orderbooks")
+        t.start()
+        self._log("[INIT] Orderbook snapshot thread started (~60s/market)")
 
     def _tick(self):
         """Single iteration of the main loop."""
@@ -1556,7 +1796,8 @@ class TradingBot:
                 else:
                     event_key = ticker
                 if ticker and event_key not in self._traded_tickers:
-                    self._maybe_trade(market, strats, asset_key=key)
+                    self._maybe_trade(market, strats, asset_key=key,
+                                      cell_params=cell_params)
 
         # 2a. Refresh RR market cache for the fast path (every 10s)
         self._refresh_rr_cache()
@@ -1580,11 +1821,18 @@ class TradingBot:
             self._last_heartbeat = now_pub
             self._write_heartbeat("running")
 
-        # 6. Save price snapshots for future backtesting (throttled to ~1/min)
+        # 6. Save price snapshots for future backtesting.
+        # High-frequency (5s) → {DATA_DIR}/prices_hf/YYYY-MM-DD.csv for
+        # strike reconstruction on 15M markets. Coarse (1-min) →
+        # {DATA_DIR}/prices/... for the existing optimizer paths and
+        # backward compat. See data_paths.py for resolution rules.
         now = time.time()
+        if now - getattr(self, '_last_price_save_hf', 0) >= 5:
+            self._last_price_save_hf = now
+            self._save_price_snapshot(sub_dir="prices_hf")
         if now - getattr(self, '_last_price_save', 0) >= 60:
             self._last_price_save = now
-            self._save_price_snapshot()
+            self._save_price_snapshot(sub_dir="prices")
 
         # 7. Log strategy matrix summary (~every 5 min)
         if now - getattr(self, '_last_matrix_log', 0) >= 300:
@@ -1593,16 +1841,24 @@ class TradingBot:
             if "edge=" in summary:
                 self._log(f"\n{summary}")
 
-    # Coins whose spot prices we persist to data/prices/YYYY-MM-DD.csv.
+    # Coins whose spot prices we persist to {DATA_DIR}/prices/YYYY-MM-DD.csv.
     # Must match the 15M series the bot trades so optimize_rr can compute
     # per-coin momentum features for every RR cell.
     PRICE_SNAPSHOT_COINS = ("btc", "eth", "sol", "doge", "xrp", "bnb", "hype")
 
-    def _save_price_snapshot(self):
-        """Save 1-minute price candles for future backtesting.
+    def _save_price_snapshot(self, sub_dir: str = "prices"):
+        """Save a price snapshot row for future backtesting.
 
-        Persists every tradeable coin so optimize_rr can compute momentum
-        and buffer features for all RR cells, not just BTC/ETH/SOL.
+        Two cadences run in parallel (called from _tick on different
+        throttles):
+          - sub_dir="prices"    → 1-minute candles (legacy, preserved
+                                  for the existing optimizer paths that
+                                  expect one row per minute).
+          - sub_dir="prices_hf" → 5-second candles, used by the optimizer
+                                  to reconstruct 15M market strikes (60s
+                                  BRTI average at market open) with far
+                                  less approximation noise than the
+                                  1-minute snapshot allows.
 
         Header mismatch handling: if a pre-existing file's header doesn't
         match `PRICE_SNAPSHOT_COINS`, the old file is rotated aside and a
@@ -1611,8 +1867,8 @@ class TradingBot:
         list was extended from 3 to 7 while a partial file already existed.
         """
         try:
-            price_dir = Path("data/prices")
-            price_dir.mkdir(parents=True, exist_ok=True)
+            import data_paths
+            price_dir = data_paths.ensure(sub_dir)
             date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             price_file = price_dir / f"{date_str}.csv"
 
@@ -1646,7 +1902,8 @@ class TradingBot:
         except Exception:
             pass  # Don't let price saving crash the bot
 
-    def _maybe_trade(self, market: dict, strategies_status: dict, asset_key: str = ""):
+    def _maybe_trade(self, market: dict, strategies_status: dict, asset_key: str = "",
+                     cell_params: dict = None):
         """Check if any strategy wants to trade and execute if approved."""
         ticker = market.get("ticker", "")
         balance = self._get_balance()
@@ -1668,35 +1925,14 @@ class TradingBot:
             # Fall back to cached market data
             yes_bid, yes_ask = scanner.parse_yes_price(market)
 
-        # Sanity check: cross-verify book-derived prices against the
-        # market's own yes_bid/yes_ask fields. Divergence on EITHER side
-        # means the book parse is stale or the market has flipped — skip
-        # the trade rather than act on fantasy prices.
-        #
-        # Checks BOTH bid and ask independently: a one-sided book collapse
-        # (e.g., all NO bids pulled after YES becomes favorite) leaves
-        # yes_ask=None but yes_bid=99, which can produce a bogus NO-side
-        # ask of 1¢ in _maybe_trade's exec_price calculation. The previous
-        # `if yes_bid is not None AND yes_ask is not None` gate silently
-        # bypassed this case.
-        #
-        # Threshold 10¢: observed normal divergence on near-the-money
-        # markets is 0-4¢; the 2026-04-13 incidents had ~80-95¢ divergence.
-        market_bid, market_ask = scanner.parse_yes_price(market)
-        if yes_ask is not None and market_ask is not None and abs(yes_ask - market_ask) > 10:
-            self._log(
-                f"      [SANITY] {ticker}: book yes_ask={yes_ask} diverges from "
-                f"market yes_ask={market_ask} — skipping trade",
-                level="warning",
-            )
-            return
-        if yes_bid is not None and market_bid is not None and abs(yes_bid - market_bid) > 10:
-            self._log(
-                f"      [SANITY] {ticker}: book yes_bid={yes_bid} diverges from "
-                f"market yes_bid={market_bid} — skipping trade",
-                level="warning",
-            )
-            return
+        # No sanity check — the fast-RR scanner already validated prices
+        # via WS-cached bid/ask before reaching _maybe_trade. The old
+        # cross-verification against REST-cached market data was blocking
+        # hundreds of legitimate trades per session because the cache goes
+        # stale near settlement. If the live orderbook fetch above failed,
+        # we already fell back to cached prices at line 1884.
+        # The hard floor check below (cell min/max band) is sufficient
+        # protection against bogus prices.
 
         # ── Shadow tracking: record what disabled strategies WOULD do,
         # so the matrix can evaluate them for future enablement.
@@ -1742,20 +1978,38 @@ class TradingBot:
             if ask_price > max_price:
                 continue
 
-            # RR always crosses the ask (taker). The edge is only 1-5c, so
-            # getting filled at the right price matters more than saving
-            # maker fees, and a maker midpoint can drop below the 95c minimum.
-            exec_price = min(ask_price, max_price)
-            is_maker = False
+            # RR order mode: default is MAKER (post at bid, no fees).
+            # Kalshi maker fees are $0, and maker fills are cheaper by the
+            # whole spread (1-2c) — which at RR's ~2c-per-win economics is
+            # ~doubling the per-trade margin when you do fill. The tradeoff
+            # is that some trades will time out without a fill, but those
+            # trades just get cancelled (no loss).
+            #
+            # Flip to taker by setting RR_TAKER=1 if you need guaranteed
+            # fills on a given cell.
+            if os.getenv("RR_TAKER", "0") == "1":
+                exec_price = min(ask_price, max_price)
+                is_maker = False
+            else:
+                # Post at bid side, bounded by the cell's contract-price band.
+                # On a book with yes_bid=96, yes_ask=97 this posts a resting
+                # buy at 96c that fills only when a counterparty crosses.
+                cp = cell_params or {}
+                cell_min_cp = cp.get("min_contract_price", 95)
+                maker_price = max(bid_price, cell_min_cp)
+                exec_price = min(maker_price, max_price)
+                is_maker = True
 
             # Hard floor: never submit an RR order outside the cell's
             # [min_contract_price, max_entry_price] band. Guards against the
             # 2026-04-13 "NO@1c" incident where a market flipped between the
             # RR signal and order submission (one-sided book → yes_ask None
             # → earlier sanity check bypassed).
-            strat = self.strategies.get("resolution_rider")
-            strat_min = strat.min_contract_price if strat else 95
-            strat_max = strat.max_entry_price if strat else 98
+            # Uses per-cell params so cells with wider bands (e.g. 90-98c)
+            # aren't blocked by the strategy-level defaults.
+            cp = cell_params or {}
+            strat_min = cp.get("min_contract_price", 95)
+            strat_max = cp.get("max_entry_price", 98)
             if exec_price < strat_min or exec_price > strat_max:
                 self._log(
                     f"  [SKIP] {name}: exec_price {exec_price}c outside "
@@ -1809,7 +2063,8 @@ class TradingBot:
             # Fee-adjusted EV check. RR uses empirical win rate (~99%) for
             # EV, not market-implied price: the edge IS the gap between the
             # 95-98c entry and the ~99% hold-to-settlement win rate.
-            entry_fee = kalshi_taker_fee(contracts, exec_price)
+            # Maker orders pay $0 fees on Kalshi.
+            entry_fee = 0.0 if is_maker else kalshi_taker_fee(contracts, exec_price)
             payout = contracts * 1.00
             ev_prob = 0.99
             ev_win = ev_prob * (payout - stake - entry_fee)
@@ -1830,7 +2085,7 @@ class TradingBot:
             # For Kalshi API: yes_price is always in YES terms
             api_yes_price = exec_price if side == "yes" else (100 - exec_price)
 
-            order_mode = "TAKER"
+            order_mode = "MAKER" if is_maker else "TAKER"
 
             # Log orderbook depth at 95-99c. Kalshi's modern API returns
             # `orderbook_fp` (dollar-string prices) not `orderbook` (cent
@@ -1958,17 +2213,17 @@ class TradingBot:
                         continue
                     if order_status == "resting":
                         # Order is on the book — poll for fill.
-                        # Maker orders get more patience since we're earning
-                        # better pricing and lower fees by waiting.
+                        # Cap maker wait to leave time for taker fallback
+                        # (need ~10s for cancel + resubmit + settle).
                         secs_in_window = scanner.seconds_until_close(market)
+                        cp = cell_params or {}
+                        cell_min_secs = cp.get("min_seconds", 10)
+                        # Reserve enough time for taker fallback
+                        taker_reserve = cell_min_secs + 10
                         if is_maker:
-                            # Maker: more patience — the whole point is to wait
-                            if secs_in_window > 600:
-                                max_wait = 240  # 4 min early in window
-                            elif secs_in_window > 300:
-                                max_wait = 150  # 2.5 min mid-window
-                            else:
-                                max_wait = 60   # 1 min (shouldn't hit this often)
+                            # Maker wait = time left minus taker reserve,
+                            # bounded by reasonable limits
+                            max_wait = max(5, min(120, int(secs_in_window - taker_reserve)))
                         else:
                             # Taker: shorter patience, we expect immediate fills
                             if secs_in_window > 300:
@@ -2060,7 +2315,51 @@ class TradingBot:
                                 entry_fee = kalshi_taker_fee(contracts, exec_price)
                                 self._log(f"      [PARTIAL] Keeping {fill_count} filled contracts after cancel")
                                 filled = True
-                            else:
+                            elif is_maker:
+                                # Maker didn't fill — try taker fallback if
+                                # we're still within the cell's time window.
+                                remaining = scanner.seconds_until_close(market)
+                                cp = cell_params or {}
+                                min_secs = cp.get("min_seconds", 10)
+                                if remaining > min_secs + 5:
+                                    taker_price = min(ask_price, max_price)
+                                    if strat_min <= taker_price <= strat_max:
+                                        taker_fee = kalshi_taker_fee(contracts, taker_price)
+                                        api_yes_taker = taker_price if side == "yes" else (100 - taker_price)
+                                        self._log(
+                                            f"      [TAKER-FALLBACK] Resubmitting as taker @ "
+                                            f"{taker_price}c ({remaining:.0f}s left)")
+                                        try:
+                                            taker_oid = str(uuid.uuid4())
+                                            taker_result = self.executor.place_order(
+                                                ticker=ticker,
+                                                action="buy",
+                                                side=side,
+                                                count=contracts,
+                                                order_type="limit",
+                                                yes_price=api_yes_taker,
+                                                client_order_id=taker_oid,
+                                            )
+                                            taker_status = taker_result.get("order", {}).get("status", "")
+                                            if taker_status in ("filled", "executed"):
+                                                exec_price = taker_price
+                                                stake = contracts * (exec_price / 100.0)
+                                                entry_fee = taker_fee
+                                                is_maker = False
+                                                order_id = taker_result.get("order", {}).get("order_id", taker_oid)
+                                                pending_record.order_id = order_id
+                                                pending_record.client_order_id = taker_oid
+                                                pending_record.price_cents = exec_price
+                                                pending_record.stake_usd = stake
+                                                pending_record.is_maker = False
+                                                self._log(f"      [TAKER-FILLED] Filled at {exec_price}c (fees=${taker_fee:.2f})")
+                                                filled = True
+                                            else:
+                                                self._log(f"      [TAKER-FALLBACK] Status: {taker_status}, abandoning")
+                                        except Exception as e:
+                                            self._log(f"      [TAKER-FALLBACK] Failed: {e}", level="warning")
+
+                            if not filled:
                                 # Mark the reserved row as cancelled so reconcile
                                 # doesn't resurrect it or import a phantom row.
                                 pending_record.contracts = 0

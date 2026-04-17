@@ -9,3 +9,9 @@ __pycache__/
 *.pyo
 python-bot/.venv
 python-bot/venv
+
+# Allow rr_params.json through — it's the live RR config and we want it
+# versioned so we can diff/revert without relying on ad-hoc dated archives.
+!python-bot/data/
+python-bot/data/*
+!python-bot/data/rr_params.json

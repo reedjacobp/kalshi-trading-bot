@@ -18,11 +18,15 @@ def main():
     params = json.load(open('data/rr_params.json'))
     safe = {k: v for k, v in params.items() if v.get('cv_val_profit', 0) > 0}
 
+    import data_paths
     prices = {}
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    price_file = f'data/prices/{today}.csv'
+    price_dir = data_paths.resolve('prices')
+    price_file = str(price_dir / f'{today}.csv')
     if not os.path.exists(price_file):
-        price_file = 'data/prices/2026-04-14.csv'
+        # Fallback: pick the newest file in the resolved prices dir.
+        existing = sorted(price_dir.glob('*.csv'))
+        price_file = str(existing[-1]) if existing else price_file
     with open(price_file) as f:
         rows = list(csv.DictReader(f))
     if rows:

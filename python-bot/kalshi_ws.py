@@ -113,11 +113,16 @@ class KalshiWebSocket:
         """Set the series prefixes to track (client-side filter)."""
         self._series = list(series_prefixes)
 
-    def enable_recording(self, data_dir: str = None):
-        """Enable persistent recording of price data for calibration."""
+    def enable_recording(self, data_dir: str = None, strike_lookup=None):
+        """Enable persistent recording of price data for calibration.
+
+        strike_lookup: optional callable(ticker) -> float|None. When set,
+        each recorded row includes the strike so the optimizer can compute
+        buffer_pct for 15M cells (whose ticker format doesn't encode it).
+        """
         if data_dir is None:
             data_dir = os.getenv("DATA_DIR", "/mnt/d/datasets/prediction-market-analysis")
-        self._recorder = TickRecorder(data_dir)
+        self._recorder = TickRecorder(data_dir, strike_lookup=strike_lookup)
         logger.info(f"[WS] Recording enabled: {data_dir}")
 
     def start(self):
@@ -301,17 +306,28 @@ class TickRecorder:
     and append-friendliness, with periodic parquet conversion available.
 
     File layout: {data_dir}/ticks/YYYY-MM-DD.csv
+
+    Optionally accepts a strike_lookup callback. For daily tickers
+    Kalshi encodes the strike in the ticker suffix (-T74399.99), but
+    15M tickers do not, so the optimizer had no way to compute buffer
+    for 15M cells when replaying the CSVs. When a lookup callback is
+    provided, each recorded row includes the strike so the optimizer
+    can use it as a feature during CV. If the lookup returns None
+    (strike unknown), the field is left blank and downstream code
+    falls back to ticker-suffix parsing.
     """
 
-    CSV_COLUMNS = ["timestamp", "ticker", "yes_bid", "yes_ask", "last_price", "volume"]
+    CSV_COLUMNS = ["timestamp", "ticker", "yes_bid", "yes_ask",
+                   "last_price", "volume", "floor_strike"]
 
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, strike_lookup=None):
         self.data_dir = Path(data_dir) / "ticks"
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._current_date: str = ""
         self._file = None
         self._writer = None
         self._rows_written = 0
+        self.strike_lookup = strike_lookup
 
     def record(self, ticker: str, yes_bid: int, yes_ask: int,
                last_price: int, volume: float):
@@ -323,6 +339,14 @@ class TickRecorder:
         if date_str != self._current_date:
             self._roll_file(date_str)
 
+        strike = None
+        if self.strike_lookup is not None:
+            try:
+                strike = self.strike_lookup(ticker)
+            except Exception:
+                strike = None
+        strike_str = f"{strike:.4f}" if strike else ""
+
         self._writer.writerow([
             now.isoformat(),
             ticker,
@@ -330,19 +354,49 @@ class TickRecorder:
             yes_ask,
             last_price,
             f"{volume:.0f}",
+            strike_str,
         ])
         self._file.flush()
         self._rows_written += 1
 
     def _roll_file(self, date_str: str):
-        """Open a new daily CSV file."""
+        """Open a new daily CSV file.
+
+        If an existing file's header doesn't match CSV_COLUMNS (e.g. it
+        was written by an older bot version with fewer columns), rotate
+        it aside so we never mix schemas within one file. The old file
+        gets renamed with a `.pre_<hhmmss>.csv` suffix and a fresh one
+        is started with the current schema. This prevents the pandas
+        "Expected N fields, saw M" parser errors that broke the
+        optimizer when we added `floor_strike` to the schema.
+        """
         if self._file:
             self._file.close()
 
         self._current_date = date_str
         filepath = self.data_dir / f"{date_str}.csv"
-        is_new = not filepath.exists()
 
+        if filepath.exists():
+            try:
+                with open(filepath, "r", newline="") as f:
+                    first = f.readline().rstrip("\r\n")
+            except Exception:
+                first = ""
+            existing_header = first.split(",") if first else []
+            if existing_header != list(self.CSV_COLUMNS):
+                ts = datetime.now(timezone.utc).strftime("%H%M%S")
+                rotated = filepath.with_suffix(f".pre_{ts}.csv")
+                try:
+                    filepath.rename(rotated)
+                    logger.warning(
+                        f"[REC] Header schema mismatch in {filepath.name} "
+                        f"(had {len(existing_header)} cols, need "
+                        f"{len(self.CSV_COLUMNS)}); rotated to {rotated.name}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[REC] Failed to rotate {filepath}: {e}")
+
+        is_new = not filepath.exists()
         self._file = open(filepath, "a", newline="")
         self._writer = csv.writer(self._file)
 
