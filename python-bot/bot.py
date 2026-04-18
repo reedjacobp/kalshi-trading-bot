@@ -2769,7 +2769,13 @@ class TradingBot:
         # the reconcile thread. Both stats AND trade list get refreshed here.
         if not hasattr(self, '_stats_refresh_ts') or time.time() - self._stats_refresh_ts > 30:
             self._hist_stats = self.logger.get_historical_stats()
-            self._hist_stats["pending"] = len([t for t in self.risk_mgr.trades if t.outcome == ""])
+            # Use the authoritative open-positions dict. Counting
+            # risk_mgr.trades entries by outcome=="" is wrong: that list is
+            # append-only and keeps orphaned records when a position is
+            # settled via the CSV-based fallback path (which does not call
+            # settle_trade). open_positions is popped correctly on
+            # settle_trade and matches heartbeat.json.
+            self._hist_stats["pending"] = len(self.risk_mgr.open_positions)
             # Also refresh the dashboard trade list from CSV
             self._dashboard_trades = self._hist_stats["trades"]
             self._stats_refresh_ts = time.time()
