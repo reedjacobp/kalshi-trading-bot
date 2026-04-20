@@ -115,10 +115,14 @@ app.use((req, res, next) => {
   // this serves both the API and the client.
   // It is the only port that is not firewalled.
   const port = parseInt(process.env.PORT || "5000", 10);
+  // Default to LAN-only (127.0.0.1) so the dashboard isn't exposed
+  // beyond the local machine. Set HOST=0.0.0.0 to make it reachable
+  // from other devices on your network (e.g. phone on wifi).
+  const host = process.env.HOST || "127.0.0.1";
   httpServer.listen(
     {
       port,
-      host: "0.0.0.0",
+      host,
       reusePort: true,
     },
     () => {

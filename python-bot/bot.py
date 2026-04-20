@@ -467,6 +467,7 @@ class TradeLogger:
 
         # Build full trade list for dashboard
         recent = []
+        seen_settled_oids: set[str] = set()
         for e in entries:
             s = next((s for s in settlements if s["order_id"] == e["order_id"]), None)
             fee = _fee(e)
@@ -488,6 +489,51 @@ class TradeLogger:
                 "order_type": order_type,
                 "order_id": e.get("order_id", ""),
             })
+            if s is not None:
+                seen_settled_oids.add(e["order_id"])
+
+        # Orphan settlements: the maker-timeout path rewrites the entry row
+        # with reason="CANCELLED: unfilled after Ns" when the bot gives up,
+        # but Kalshi may still fill the order afterward. That leaves a
+        # SETTLED row whose only companion is a CANCELLED row — filtered out
+        # of `entries` above, so the trade never lands on the dashboard.
+        # Recover these by using the CANCELLED row (or the settlement row
+        # itself) as the entry source.
+        all_settled_oids = {s["order_id"] for s in settlements}
+        orphan_oids = all_settled_oids - seen_settled_oids
+        if orphan_oids:
+            cancelled_by_oid = {
+                r["order_id"]: r for r in rows
+                if r.get("reason", "").startswith("CANCELLED")
+            }
+            for s in settlements:
+                oid = s["order_id"]
+                if oid not in orphan_oids:
+                    continue
+                src = cancelled_by_oid.get(oid, s)
+                fee = _fee(s) if s.get("fees_usd") else _fee(src)
+                profit = round(float(s["profit_usd"]), 2)
+                try:
+                    price = int(src.get("price_cents") or s["price_cents"])
+                    contracts = int(src.get("contracts") or s["contracts"])
+                    stake = round(float(src.get("stake_usd") or s["stake_usd"]), 2)
+                except (ValueError, TypeError):
+                    continue
+                recent.append({
+                    "time": src.get("time") or s["time"],
+                    "ticker": src.get("ticker") or s["ticker"],
+                    "strategy": src.get("strategy") or s.get("strategy", ""),
+                    "side": src.get("side") or s["side"],
+                    "price": price,
+                    "contracts": contracts,
+                    "stake": stake,
+                    "outcome": s["outcome"],
+                    "profit": profit,
+                    "fees": round(fee, 2),
+                    "profit_after_fees": round(profit - fee, 2),
+                    "order_type": src.get("order_type") or s.get("order_type") or "taker",
+                    "order_id": oid,
+                })
 
         return {
             "daily_gross": round(daily_gross, 2),
@@ -506,7 +552,10 @@ class TradeLogger:
             "wins": wins,
             "losses": losses,
             "pending": len(unsettled),
-            "trades": list(reversed(recent)),  # newest first
+            # Sort by time so the orphan-recovery path (which appends at
+            # the end of the list regardless of when the settlement
+            # happened) doesn't corrupt chronological order.
+            "trades": sorted(recent, key=lambda r: r.get("time", ""), reverse=True),
         }
 
 
@@ -1090,6 +1139,38 @@ class TradingBot:
         self._traded_tickers: set = set()
         self._last_settled_ticker: str = ""
 
+        # Rolling buffer of recent [SKIP] events (book moved between RR
+        # signal and order submission). Surfaced on the dashboard so dry
+        # spells are diagnosable without tailing logs.
+        self._recent_skips: list[dict] = []
+
+        # Per-hit outcome telemetry — one row per [FAST-RR] Hit in
+        # data/hit_outcomes.csv. Lets us diagnose conversion rate
+        # (Hit→submit) and see which gates are dropping trades.
+        # Outcomes: submitted, skip_book_moved, skip_outside_band,
+        # skip_risk_rejected, skip_balance_low, skip_negative_ev.
+        self._hit_outcomes_csv = Path("data/hit_outcomes.csv")
+        self._hit_outcomes_csv.parent.mkdir(parents=True, exist_ok=True)
+        if not self._hit_outcomes_csv.exists():
+            with open(self._hit_outcomes_csv, "w", newline="") as f:
+                csv.writer(f).writerow([
+                    "time", "ticker", "strategy", "side", "max_price_c",
+                    "yes_bid_c", "yes_ask_c", "outcome", "reason",
+                    "ask_price_c", "exec_price_c", "stake_usd",
+                    "secs_left", "cell",
+                ])
+        self._hit_ctx: Optional[dict] = None
+        # Rolling 24h outcome counts for dashboard summary.
+        self._hit_outcome_counts: dict = {}
+        self._hit_outcome_window_start: float = time.time()
+
+        # Per-ticker gate state for the dashboard matrix. Keyed by ticker
+        # → {cell, blocked_at, detail, last_seen}. blocked_at="passed"
+        # means the ticker cleared every gate and hit _maybe_trade. This
+        # lets the dashboard render a live "why is this ticker not firing"
+        # table without the user tailing logs.
+        self._ticker_gate_state: dict = {}
+
         # Resolve unsettled trades from previous runs
         self._resolve_unsettled_trades()
 
@@ -1375,8 +1456,19 @@ class TradingBot:
                 self._log(f"  [FRR-DBG] last 60s: {summary}")
             dbg["counts"].clear()
 
-        def bump(cell, reason):
+        def bump(cell, reason, ticker: str = "", detail: Optional[dict] = None):
             dbg["counts"][f"{cell}.{reason}"] += 1
+            # Per-ticker state for the dashboard gate-matrix visualization.
+            # Only update when we know which ticker was being evaluated —
+            # cell-level failures (like no_markets) don't tie to a ticker.
+            if ticker:
+                self._ticker_gate_state[ticker] = {
+                    "ticker": ticker,
+                    "cell": cell,
+                    "blocked_at": reason,
+                    "detail": detail or {},
+                    "last_seen": time.time(),
+                }
 
         for key, asset in self.assets.items():
             cache = asset.get("_rr_market")
@@ -1417,7 +1509,7 @@ class TradingBot:
                     bump(cell_name, "no_ticker")
                     continue
                 if ticker in self._traded_tickers or ticker in self.risk_mgr.open_positions:
-                    bump(cell_name, "already_traded")
+                    bump(cell_name, "already_traded", ticker=ticker)
                     continue
 
                 # Time check from cached close_time (no I/O)
@@ -1426,13 +1518,17 @@ class TradingBot:
                     close_dt = datetime.fromisoformat(close_str)
                     secs_left = max(0, (close_dt - datetime.now(timezone.utc)).total_seconds())
                 except (ValueError, TypeError):
-                    bump(cell_name, "bad_close_time")
+                    bump(cell_name, "bad_close_time", ticker=ticker)
                     continue
                 if secs_left < rr.min_seconds:
-                    bump(cell_name, "secs_too_low")
+                    bump(cell_name, "secs_too_low", ticker=ticker,
+                         detail={"secs_left": round(secs_left, 1),
+                                 "min_required": rr.min_seconds})
                     continue
                 if secs_left > cell_max_secs:
-                    bump(cell_name, "secs_too_high")
+                    bump(cell_name, "secs_too_high", ticker=ticker,
+                         detail={"secs_left": round(secs_left, 1),
+                                 "max_allowed": cell_max_secs})
                     continue
 
                 # Price check — prefer live WS, fall back to cached REST
@@ -1446,7 +1542,8 @@ class TradingBot:
                     bid = market_cache.get("yes_bid")
                     ask = market_cache.get("yes_ask")
                     if not bid or not ask:
-                        bump(cell_name, "no_price")
+                        bump(cell_name, "no_price", ticker=ticker,
+                             detail={"secs_left": round(secs_left, 1)})
                         continue
 
                 cell_min_cp = cell_params.get("min_contract_price", rr.min_contract_price)
@@ -1454,27 +1551,34 @@ class TradingBot:
                 yes_mid = (bid + ask) / 2
                 fav = max(yes_mid, 100 - yes_mid)
                 if fav < cell_min_cp:
-                    bump(cell_name, "fav_too_low")
+                    bump(cell_name, "fav_too_low", ticker=ticker,
+                         detail={"secs_left": round(secs_left, 1),
+                                 "yes_bid": bid, "yes_ask": ask,
+                                 "fav": round(fav, 1), "min_required": cell_min_cp})
                     continue
                 if fav > cell_max_ep:
-                    bump(cell_name, "fav_too_high")
+                    bump(cell_name, "fav_too_high", ticker=ticker,
+                         detail={"secs_left": round(secs_left, 1),
+                                 "yes_bid": bid, "yes_ask": ask,
+                                 "fav": round(fav, 1), "max_allowed": cell_max_ep})
                     continue
 
                 # Price buffer check (WS-cached crypto price, zero I/O)
                 feed = asset["price_feed"]
                 if not feed.current_price:
-                    bump(cell_name, "no_spot")
+                    bump(cell_name, "no_spot", ticker=ticker,
+                         detail={"secs_left": round(secs_left, 1)})
                     continue
                 if not market_cache.get("floor_strike"):
-                    bump(cell_name, "no_strike")
+                    bump(cell_name, "no_strike", ticker=ticker)
                     continue
                 try:
                     strike = float(market_cache["floor_strike"])
                 except (ValueError, TypeError):
-                    bump(cell_name, "bad_strike")
+                    bump(cell_name, "bad_strike", ticker=ticker)
                     continue
                 if strike <= 0:
-                    bump(cell_name, "bad_strike")
+                    bump(cell_name, "bad_strike", ticker=ticker)
                     continue
                 buffer_pct = (feed.current_price - strike) / strike * 100
 
@@ -1488,12 +1592,18 @@ class TradingBot:
                 if yes_mid >= no_mid:
                     # YES side favored — price must be ABOVE strike by buffer
                     if buffer_pct < cell_buf_required:
-                        bump(cell_name, "yes_buf_low")
+                        bump(cell_name, "yes_buf_low", ticker=ticker,
+                             detail={"secs_left": round(secs_left, 1),
+                                     "buffer_pct": round(buffer_pct, 3),
+                                     "required_pct": round(cell_buf_required, 3)})
                         continue
                 else:
                     # NO side favored — price must be BELOW strike by buffer
                     if buffer_pct > -cell_buf_required:
-                        bump(cell_name, "no_buf_high")
+                        bump(cell_name, "no_buf_high", ticker=ticker,
+                             detail={"secs_left": round(secs_left, 1),
+                                     "buffer_pct": round(buffer_pct, 3),
+                                     "required_pct": round(cell_buf_required, 3)})
                         continue
 
                 # Passed all fast checks — do full evaluation and trade
@@ -1525,15 +1635,46 @@ class TradingBot:
                 rec = rr.evaluate(market_dict, None, feed, shim,
                                   cell_params=cell_params)
                 if not rec.should_trade:
-                    bump(cell_name, "eval_no_trade")
+                    bump(cell_name, "eval_no_trade", ticker=ticker,
+                         detail={"secs_left": round(secs_left, 1),
+                                 "yes_bid": bid, "yes_ask": ask,
+                                 "buffer_pct": round(buffer_pct, 3),
+                                 "rec_reason": rec.reason[:80]})
                     continue
 
                 # Check matrix
                 if not self.strategy_matrix.is_enabled(key, "resolution_rider"):
-                    bump(cell_name, "matrix_disabled")
+                    bump(cell_name, "matrix_disabled", ticker=ticker)
                     continue
 
+                # Ticker passed every gate — record for the dashboard so
+                # the matrix shows a green row (vs red for any blocked gate).
+                self._ticker_gate_state[ticker] = {
+                    "ticker": ticker,
+                    "cell": cell_name,
+                    "blocked_at": "passed",
+                    "detail": {"secs_left": round(secs_left, 1),
+                               "yes_bid": bid, "yes_ask": ask,
+                               "buffer_pct": round(buffer_pct, 3)},
+                    "last_seen": time.time(),
+                }
+
                 self._log(f"  [FAST-RR] Hit: {ticker} {rec.reason}")
+                # Seed the hit-outcome context. _maybe_trade will finalize
+                # it at whichever exit path fires, writing a row to
+                # hit_outcomes.csv. If _maybe_trade returns without
+                # finalizing (shouldn't happen after this change), the
+                # next Hit will overwrite and we'll notice a gap in the
+                # CSV relative to Hit log lines.
+                self._hit_ctx = {
+                    "time": datetime.now(timezone.utc).isoformat(),
+                    "ticker": ticker,
+                    "strategy": "resolution_rider",
+                    "side": rec.signal.value,
+                    "max_price_c": rec.max_price_cents,
+                    "secs_left": round(secs_left, 1),
+                    "cell": cell_name,
+                }
                 strats = {"resolution_rider": rec}
                 # Dedupe against the slow path: on daily markets the slow
                 # path checks an event_key = ticker without the strike suffix
@@ -1925,6 +2066,12 @@ class TradingBot:
             # Fall back to cached market data
             yes_bid, yes_ask = scanner.parse_yes_price(market)
 
+        # Latch fresh book values onto the hit context so every downstream
+        # outcome row captures the book the decision was made against.
+        if self._hit_ctx is not None:
+            self._hit_ctx["yes_bid_c"] = yes_bid
+            self._hit_ctx["yes_ask_c"] = yes_ask
+
         # No sanity check — the fast-RR scanner already validated prices
         # via WS-cached bid/ask before reaching _maybe_trade. The old
         # cross-verification against REST-cached market data was blocking
@@ -1976,6 +2123,16 @@ class TradingBot:
                 bid_price = (100 - yes_ask) if yes_ask is not None else (ask_price - 4)
 
             if ask_price > max_price:
+                # Book collapsed between RR signal detection and the fresh
+                # orderbook fetch above — typical in the last 60-90s before
+                # settlement when a market resolves quickly. Log so dry
+                # spells are diagnosable without digging through debug feeds.
+                self._log(
+                    f"  [SKIP] {name}: {ticker} ask {ask_price}c > max {max_price}c "
+                    f"(book moved; yes_bid={yes_bid} yes_ask={yes_ask})"
+                )
+                self._record_skip(ticker, name, side, ask_price, max_price,
+                                  yes_bid, yes_ask)
                 continue
 
             # RR order mode: default is MAKER (post at bid, no fees).
@@ -2017,6 +2174,11 @@ class TradingBot:
                     f"(book moved between signal and submission)",
                     level="warning",
                 )
+                self._log_hit_outcome(
+                    "skip_outside_band",
+                    reason=f"exec {exec_price}c not in [{strat_min},{strat_max}]",
+                    exec_price_c=exec_price,
+                )
                 continue
 
             calibrated_p = rec.confidence
@@ -2031,6 +2193,17 @@ class TradingBot:
                 balance_usd=balance,
             )
             if not approved:
+                # This was silent before — we fixed the visibility gap
+                # after seeing 72/122 hits over 3 days end up with no
+                # observable outcome. risk_mgr rejects (daily-loss cap,
+                # open-position limit, confidence floor) now land in
+                # hit_outcomes.csv with the reason string attached.
+                self._log(f"  [SKIP] {name}: {ticker} risk_mgr rejected ({reason})")
+                self._log_hit_outcome(
+                    "skip_risk_rejected",
+                    reason=reason,
+                    exec_price_c=exec_price,
+                )
                 continue
 
             # RR position sizing: single flat STAKE_USD (read once in
@@ -2053,6 +2226,11 @@ class TradingBot:
                 price_frac = exec_price / 100.0
                 if price_frac <= 0 or balance < price_frac:
                     self._log(f"  [SKIP] {name}: balance ${balance:.2f} < 1 contract @ {exec_price}c")
+                    self._log_hit_outcome(
+                        "skip_balance_low",
+                        reason=f"balance ${balance:.2f} < 1 contract @ {exec_price}c",
+                        exec_price_c=exec_price,
+                    )
                     continue
                 new_contracts = int(balance / price_frac)
                 new_stake = new_contracts * price_frac
@@ -2073,6 +2251,12 @@ class TradingBot:
             if expected_value <= 0:
                 self._log(f"  [SKIP] {name}: negative EV after fees "
                           f"(EV=${expected_value:.2f}, fees=${entry_fee:.2f})")
+                self._log_hit_outcome(
+                    "skip_negative_ev",
+                    reason=f"EV=${expected_value:.2f} fees=${entry_fee:.2f}",
+                    exec_price_c=exec_price,
+                    stake_usd=round(stake, 2),
+                )
                 continue
 
             # Execute — mark ticker BEFORE placing order to prevent re-entry
@@ -2372,6 +2556,12 @@ class TradingBot:
                                 continue
 
                 self._log(f"      Order placed: {order_id}")
+                self._log_hit_outcome(
+                    "submitted",
+                    reason=order_id,
+                    exec_price_c=exec_price,
+                    stake_usd=round(stake, 2),
+                )
 
                 # Reconcile with actual fills from Kalshi —
                 # limit orders can fill at much better prices than requested,
@@ -2677,16 +2867,14 @@ class TradingBot:
         eth = _price_data("eth")
         sol = _price_data("sol")
 
-        # Gather momentum for every tradeable coin so the dashboard can
-        # show the exact values the bot uses for RR gating. Avoids the
-        # guesswork that led to the 2026-04-14 XRP/SOL losses where we
-        # were blind to the live momentum on non-BTC coins.
+        # Gather momentum for every tradeable asset key so the dashboard
+        # can show the exact values the bot uses for RR gating. Includes
+        # both 15M and _daily entries — same price feed but different
+        # cell windows, so each gets its own gate context.
         asset_momentum = {}
-        for coin in ("btc", "eth", "sol", "doge", "xrp", "bnb", "hype"):
-            if coin not in self.assets:
-                continue
-            pd = _price_data(coin)
-            asset_momentum[coin] = {
+        for key in self.assets.keys():
+            pd = _price_data(key)
+            asset_momentum[key] = {
                 "price": round(pd["price"], 4) if pd["price"] else 0,
                 "mom_1m": round(pd["mom_1m"], 4),
                 "mom_5m": round(pd["mom_5m"], 4),
@@ -2797,22 +2985,12 @@ class TradingBot:
             "current_market": _market_data("btc"),
             "last_settled": _settled_data("btc"),
             "strategies": _strat_data("btc"),
-            # Per-asset markets, settlements, and strategies
-            "markets": {
-                "btc": _market_data("btc"),
-                "eth": _market_data("eth"),
-                "sol": _market_data("sol"),
-            },
-            "settled": {
-                "btc": _settled_data("btc"),
-                "eth": _settled_data("eth"),
-                "sol": _settled_data("sol"),
-            },
-            "strategies_by_asset": {
-                "btc": _strat_data("btc"),
-                "eth": _strat_data("eth"),
-                "sol": _strat_data("sol"),
-            },
+            # Per-asset markets, settlements, and strategies — all 14
+            # asset keys (7 coins × {15M, daily}) so the dashboard can
+            # surface every market the bot is actually trading.
+            "markets": {key: _market_data(key) for key in self.assets.keys()},
+            "settled": {key: _settled_data(key) for key in self.assets.keys()},
+            "strategies_by_asset": {key: _strat_data(key) for key in self.assets.keys()},
             "asset_momentum": asset_momentum,
             "trading_enabled": _sse_state.trading_enabled,
             "vol_regime": "medium",  # Vol-regime gating removed; RR uses per-cell optimized params.
@@ -2854,6 +3032,14 @@ class TradingBot:
                 "is_paper": is_paper,
             },
             "strategy_matrix": self.strategy_matrix.get_matrix_snapshot(),
+            "recent_skips": self._recent_skips[-20:],
+            "hit_outcomes_summary": {
+                "window_hours": 24,
+                "counts": dict(self._hit_outcome_counts),
+                "total": sum(self._hit_outcome_counts.values()),
+                "fills": self._hit_outcome_counts.get("submitted", 0),
+            },
+            "gate_matrix": self._build_gate_matrix_snapshot(),
             "rr_config": {
                 "defaults": {
                     "min_contract_price": rr.min_contract_price,
@@ -2865,6 +3051,18 @@ class TradingBot:
                     "max_stake_usd": self.config["stake_usd"],
                 },
                 "per_cell": {k: {
+                    # Raw numeric fields — dashboard formats these. Units:
+                    #   *_contract_price / *_entry_price → cents (int)
+                    #   min_seconds / max_seconds       → seconds (int)
+                    #   min_price_buffer_pct            → percent (float, e.g. 0.68 = 0.68%)
+                    #   mom_gate (max_adverse_momentum) → percent, negative (float)
+                    #   vol_gate (max_realized_vol_pct) → percent (float) or null when disabled
+                    "min_contract_price": v["min_contract_price"],
+                    "max_entry_price": v["max_entry_price"],
+                    "min_seconds": v.get("min_seconds"),
+                    "max_seconds": v["max_seconds"],
+                    "min_price_buffer_pct": v["min_price_buffer_pct"],
+                    # Display-formatted convenience strings (kept for back-compat)
                     "price": f"{v['min_contract_price']}-{v['max_entry_price']}c",
                     "max_secs": v["max_seconds"],
                     "buffer": f"{v['min_price_buffer_pct']}%",
@@ -2940,6 +3138,118 @@ class TradingBot:
             stake=record.stake_usd,
             outcome=record.outcome,
         )
+
+    # Canonical gate order — MUST match the order of `bump(cell, reason)`
+    # calls inside _fast_rr_scan so the dashboard can render columns
+    # green (passed) / red (blocked here) / gray (not reached).
+    GATE_ORDER: list[str] = [
+        "already_traded", "bad_close_time",
+        "secs_too_low", "secs_too_high",
+        "no_price", "fav_too_low", "fav_too_high",
+        "no_spot", "no_strike", "bad_strike",
+        "yes_buf_low", "no_buf_high",
+        "eval_no_trade", "matrix_disabled",
+    ]
+
+    def _build_gate_matrix_snapshot(self) -> list:
+        """Per-ticker gate state for the dashboard matrix. Emits one row
+        per active ticker (seen in the last 120s), sorted by cell then
+        ticker. Each row has enough context to explain WHY a particular
+        market isn't firing right now."""
+        cutoff = time.time() - 120
+        rows = []
+        for ticker, st in self._ticker_gate_state.items():
+            if st.get("last_seen", 0) < cutoff:
+                continue
+            rows.append({
+                "ticker": ticker,
+                "cell": st.get("cell", ""),
+                "blocked_at": st.get("blocked_at", ""),
+                "detail": st.get("detail", {}),
+                "age_s": round(time.time() - st.get("last_seen", 0), 1),
+            })
+        rows.sort(key=lambda r: (r["cell"], r["ticker"]))
+        return {"gates": self.GATE_ORDER, "rows": rows}
+
+    def _record_skip(self, ticker: str, strategy: str, side: str,
+                     ask_price: int, max_price: int,
+                     yes_bid: Optional[int], yes_ask: Optional[int]):
+        """Compatibility shim — the book-moved path was the first
+        instrumented skip. Now routed through _log_hit_outcome so every
+        skip reason lands in hit_outcomes.csv uniformly."""
+        self._log_hit_outcome(
+            "skip_book_moved",
+            reason="ask_gt_max",
+            ask_price_c=ask_price,
+            yes_bid_c=yes_bid, yes_ask_c=yes_ask,
+        )
+
+    def _log_hit_outcome(self, outcome: str, reason: str = "", **extras):
+        """Write one row to hit_outcomes.csv describing what happened to
+        the last [FAST-RR] Hit. Called from the Hit site (to set ctx) and
+        from every exit point in _maybe_trade (to finalize it).
+
+        Falls back to a minimal row if ctx wasn't set — keeps auditing
+        honest even if a code path bypasses the Hit→ctx setup."""
+        ctx = self._hit_ctx or {}
+        now_iso = datetime.now(timezone.utc).isoformat()
+        row = {
+            "time": ctx.get("time", now_iso),
+            "ticker": ctx.get("ticker", extras.get("ticker", "")),
+            "strategy": ctx.get("strategy", extras.get("strategy", "")),
+            "side": ctx.get("side", extras.get("side", "")),
+            "max_price_c": ctx.get("max_price_c", extras.get("max_price_c", "")),
+            "yes_bid_c": extras.get("yes_bid_c", ctx.get("yes_bid_c", "")),
+            "yes_ask_c": extras.get("yes_ask_c", ctx.get("yes_ask_c", "")),
+            "outcome": outcome,
+            "reason": reason,
+            "ask_price_c": extras.get("ask_price_c", ""),
+            "exec_price_c": extras.get("exec_price_c", ""),
+            "stake_usd": extras.get("stake_usd", ""),
+            "secs_left": ctx.get("secs_left", ""),
+            "cell": ctx.get("cell", ""),
+        }
+
+        # Append to CSV (best-effort; never crash the trade loop on IO).
+        try:
+            with open(self._hit_outcomes_csv, "a", newline="") as f:
+                csv.writer(f).writerow([
+                    row["time"], row["ticker"], row["strategy"], row["side"],
+                    row["max_price_c"], row["yes_bid_c"], row["yes_ask_c"],
+                    row["outcome"], row["reason"],
+                    row["ask_price_c"], row["exec_price_c"], row["stake_usd"],
+                    row["secs_left"], row["cell"],
+                ])
+        except Exception:
+            pass
+
+        # Rolling 24h counter for dashboard summary.
+        if time.time() - self._hit_outcome_window_start > 86400:
+            self._hit_outcome_counts = {}
+            self._hit_outcome_window_start = time.time()
+        self._hit_outcome_counts[outcome] = self._hit_outcome_counts.get(outcome, 0) + 1
+
+        # Mirror skip-kind outcomes to the _recent_skips dashboard feed so
+        # the existing RecentSkipsPanel shows them with the right reason
+        # (was showing only book_moved before).
+        if outcome.startswith("skip_"):
+            self._recent_skips.append({
+                "timestamp": row["time"],
+                "ticker": row["ticker"],
+                "strategy": row["strategy"],
+                "side": row["side"],
+                "ask_price": row["ask_price_c"] if row["ask_price_c"] != "" else 0,
+                "max_price": row["max_price_c"] if row["max_price_c"] != "" else 0,
+                "yes_bid": row["yes_bid_c"] if row["yes_bid_c"] != "" else None,
+                "yes_ask": row["yes_ask_c"] if row["yes_ask_c"] != "" else None,
+                "reason": outcome.replace("skip_", "") + (f":{reason}" if reason else ""),
+            })
+            if len(self._recent_skips) > 50:
+                self._recent_skips = self._recent_skips[-50:]
+
+        # Clear the context so a later exit in a nested call doesn't
+        # accidentally log against a stale hit.
+        self._hit_ctx = None
 
     def _write_heartbeat(self, status: str = "running"):
         """Write heartbeat file for external monitoring."""
@@ -3117,6 +3427,70 @@ class TradingBot:
         self.running = False
         self.ws_feed.stop()
 
+    def reload_rr_params(self) -> dict:
+        """Re-read data/rr_params.json and re-apply the cell safety gate +
+        strategy-matrix enable/disable. Called from the SIGHUP handler so
+        the nightly auto-reoptimizer can deploy new params without a full
+        bot restart.
+
+        Returns a summary dict with {"loaded": n, "disabled": [cells...]}."""
+        rr_params_path = Path("data/rr_params.json")
+        if not rr_params_path.exists():
+            self._log("[RELOAD] rr_params.json missing — keeping current params", level="warning")
+            return {"loaded": 0, "disabled": []}
+        with open(rr_params_path) as f:
+            all_rr_params = json.load(f)
+
+        enable_all = os.environ.get("RR_ENABLE_ALL", "0") == "1"
+
+        def _cell_is_safe(v: dict) -> bool:
+            if enable_all:
+                return (v.get("cv_total_val_trades", 0) >= 10
+                        or v.get("training_trades", 0) >= 5)
+            if v.get("cv_folds", 0) == 0:
+                return v.get("training_profit", 0) > 0
+            wr_lb = v.get("cv_wr_lower_bound", 0)
+            trades = v.get("cv_total_val_trades", 0)
+            profit = v.get("cv_val_profit", -999)
+            if trades < 30:
+                return False
+            if wr_lb >= 0.93:
+                return True
+            if profit > 0 and wr_lb >= 0.80:
+                return True
+            min_cp = v.get("min_contract_price", 95)
+            if wr_lb >= (min_cp / 100.0) and trades >= 50:
+                return True
+            return False
+
+        safe_cells = {k: v for k, v in all_rr_params.items() if _cell_is_safe(v)}
+        prev_cells = set(self._rr_cell_params.keys())
+        new_cells = set(safe_cells.keys())
+        added = sorted(new_cells - prev_cells)
+        removed = sorted(prev_cells - new_cells)
+
+        # Atomic swap — never leave the bot in a half-updated state.
+        self._rr_cell_params = safe_cells
+        self._log(f"[RELOAD] RR params reloaded: {len(safe_cells)} safe cells")
+        if added:
+            self._log(f"[RELOAD] newly enabled: {', '.join(added)}")
+        if removed:
+            self._log(f"[RELOAD] newly disabled: {', '.join(removed)}")
+
+        # Re-sync the strategy matrix to mirror cell state.
+        for asset in self.assets.keys():
+            if asset.endswith("_daily"):
+                cell = asset.replace("_daily", "_hourly")
+            else:
+                cell = f"{asset}_15m"
+            if cell in self._rr_cell_params:
+                self.strategy_matrix.force_enable(asset, "resolution_rider", clear_history=False)
+            else:
+                self.strategy_matrix.force_disable(asset, "resolution_rider", hard=True)
+
+        unsafe = set(all_rr_params.keys()) - new_cells
+        return {"loaded": len(safe_cells), "disabled": sorted(unsafe)}
+
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────
 
@@ -3130,6 +3504,16 @@ def main():
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
+    # SIGHUP: hot-reload rr_params.json. The nightly auto-reoptimizer
+    # uses this so deploys don't require a full restart (and don't
+    # interrupt any open position).
+    def handle_sighup(signum, frame):
+        try:
+            bot.reload_rr_params()
+        except Exception as e:
+            bot._log(f"[RELOAD] reload_rr_params failed: {e}", level="error")
+    signal.signal(signal.SIGHUP, handle_sighup)
 
     bot.run()
 

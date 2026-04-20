@@ -1,0 +1,48 @@
+[Unit]
+Description=Kalshi dashboard (React frontend + SSE proxy to bot)
+Documentation=file:/home/jake/workspaces/kalshi-trading-bot/AUTO_REOPTIMIZE.md
+# The dashboard proxies /api/stream to the bot's port 5050. We start
+# after the bot so the first SSE connection isn't a dead proxy retry —
+# not strictly required (the dashboard auto-retries every 3s) but
+# produces a cleaner boot log.
+After=network-online.target kalshi-bot.service
+Wants=network-online.target
+# Crash-loop guard: a broken dist bundle would thrash otherwise.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=jake
+Group=jake
+WorkingDirectory=/home/jake/workspaces/kalshi-trading-bot
+
+# LAN-only by default — reachable via http://localhost:5000 on this PC.
+# Set HOST=0.0.0.0 in an override or directly here to expose to the
+# whole local network (phone on wifi etc.).
+Environment=PORT=5000
+Environment=HOST=127.0.0.1
+Environment=NODE_ENV=production
+
+# Node binary from fnm's persistent install. If you `fnm use` a
+# different version, either update this path or symlink
+# /usr/local/bin/node -> the version you want systemd to use.
+ExecStart=/home/jake/.local/share/fnm/node-versions/v22.22.1/installation/bin/node /home/jake/workspaces/kalshi-trading-bot/dist/index.cjs
+
+# Clean shutdown path.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+Restart=on-failure
+RestartSec=10
+
+# Dashboard is a thin proxy + static server; shouldn't need more than
+# a few hundred MB even under load.
+MemoryMax=1G
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kalshi-dashboard
+
+[Install]
+WantedBy=multi-user.target

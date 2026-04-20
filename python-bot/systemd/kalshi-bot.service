@@ -1,0 +1,49 @@
+[Unit]
+Description=Kalshi Resolution Rider trading bot
+Documentation=file:/home/jake/workspaces/kalshi-trading-bot/python-bot/AUTO_REOPTIMIZE.md
+After=network-online.target
+Wants=network-online.target
+# Crash-loop guard: if the bot restarts >5× in 300s, stop trying. Better
+# to alert the operator than have a broken bot hammer Kalshi's API.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=jake
+Group=jake
+WorkingDirectory=/home/jake/workspaces/kalshi-trading-bot/python-bot
+
+# Load Kalshi API creds + bot config (already in place).
+EnvironmentFile=/home/jake/workspaces/kalshi-trading-bot/python-bot/.env
+
+ExecStart=/home/jake/workspaces/kalshi-trading-bot/python-bot/.venv/bin/python bot.py
+
+# SIGHUP -> hot-reload rr_params.json (wired up in bot.main()). Lets
+# `systemctl reload kalshi-bot` do the same thing as the nightly cron's
+# kill -HUP, without restarting the process.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Shutdown: clean SIGTERM gives bot.handle_signal a chance to write the
+# final heartbeat + stop the ws feed. 30s is generous.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Auto-restart on crash. Crash-loop limiter is in [Unit] above.
+Restart=on-failure
+RestartSec=15
+
+# Memory guardrail: the bot's normal RSS sits ~1-2GB; anything above
+# this is a leak and deserves a restart rather than an OOM-kill of the
+# whole WSL box.
+MemoryMax=3G
+
+# Journal captures all stdout/stderr. The bot also writes its own
+# timestamped log file under data/logs/bot_<date>.log so both live
+# views are available.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kalshi-bot
+
+[Install]
+WantedBy=multi-user.target

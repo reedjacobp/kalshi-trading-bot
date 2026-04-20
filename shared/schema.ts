@@ -72,21 +72,15 @@ export const tickDataSchema = z.object({
   strategies: z.object({
     resolution_rider: strategySignalSchema,
   }),
-  markets: z.object({
-    btc: marketDataSchema.nullable(),
-    eth: marketDataSchema.nullable(),
-    sol: marketDataSchema.nullable(),
-  }),
-  settled: z.object({
-    btc: z.object({ ticker: z.string(), result: z.enum(["yes", "no"]) }).nullable(),
-    eth: z.object({ ticker: z.string(), result: z.enum(["yes", "no"]) }).nullable(),
-    sol: z.object({ ticker: z.string(), result: z.enum(["yes", "no"]) }).nullable(),
-  }),
-  strategies_by_asset: z.object({
-    btc: z.object({ resolution_rider: strategySignalSchema }),
-    eth: z.object({ resolution_rider: strategySignalSchema }),
-    sol: z.object({ resolution_rider: strategySignalSchema }),
-  }),
+  // Per-asset payload. Keys are the bot's asset keys: btc/eth/sol/doge/xrp/bnb/hype
+  // for 15M markets, plus btc_daily/eth_daily/... for the daily/hourly variants.
+  markets: z.record(marketDataSchema.nullable()),
+  settled: z.record(
+    z.object({ ticker: z.string(), result: z.enum(["yes", "no"]) }).nullable(),
+  ),
+  strategies_by_asset: z.record(
+    z.object({ resolution_rider: strategySignalSchema }),
+  ),
   asset_momentum: z.record(assetMomentumSchema).optional(),
   // enabled_assets removed 2026-04-14 — the only runtime control is
   // the global `trading_enabled` pause.
@@ -136,6 +130,13 @@ export const tickDataSchema = z.object({
       max_stake_usd: z.number(),
     }),
     per_cell: z.record(z.object({
+      // Raw numeric thresholds (units documented in bot.py _publish_tick)
+      min_contract_price: z.number().optional(),
+      max_entry_price: z.number().optional(),
+      min_seconds: z.number().nullable().optional(),
+      max_seconds: z.number().optional(),
+      min_price_buffer_pct: z.number().optional(),
+      // Display-formatted convenience strings
       price: z.string(),
       max_secs: z.number(),
       buffer: z.string(),
@@ -145,6 +146,33 @@ export const tickDataSchema = z.object({
       vol_gate: z.number().nullable().optional(),
       cv_wr: z.number().nullable(),
       cv_trades: z.number(),
+    })),
+  }).optional(),
+  recent_skips: z.array(z.object({
+    timestamp: z.string(),
+    ticker: z.string(),
+    strategy: z.string(),
+    side: z.string(),
+    ask_price: z.union([z.number(), z.string()]),
+    max_price: z.union([z.number(), z.string()]),
+    yes_bid: z.union([z.number(), z.string()]).nullable(),
+    yes_ask: z.union([z.number(), z.string()]).nullable(),
+    reason: z.string(),
+  })).optional(),
+  hit_outcomes_summary: z.object({
+    window_hours: z.number(),
+    counts: z.record(z.number()),
+    total: z.number(),
+    fills: z.number(),
+  }).optional(),
+  gate_matrix: z.object({
+    gates: z.array(z.string()),
+    rows: z.array(z.object({
+      ticker: z.string(),
+      cell: z.string(),
+      blocked_at: z.string(),
+      detail: z.record(z.union([z.number(), z.string()])),
+      age_s: z.number(),
     })),
   }).optional(),
   trades: z.array(tradeSchema),

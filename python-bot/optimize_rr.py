@@ -226,38 +226,125 @@ def sample_params() -> dict:
     return p
 
 
+def perturb_around(anchor: dict, n: int) -> list[dict]:
+    """Generate `n` local-search candidates around an anchor param dict.
+    Used by PHASE=refine to refit continuous dims (buffer, momentum)
+    near a known-good point rather than searching the whole space.
+
+    Strategy: each dim gets its own noise scale tuned to how much the
+    space tolerates wiggling. Continuous dims (buffer, momentum) get
+    gaussian perturbations; discrete ones get local neighbor picks."""
+    out = []
+    a_mcp = anchor["min_contract_price"]
+    a_mep = anchor["max_entry_price"]
+    a_mins = anchor.get("min_seconds", 10)
+    a_maxs = anchor["max_seconds"]
+    a_buf = anchor["min_price_buffer_pct"]
+    a_mom = anchor["max_adverse_momentum"]
+    a_mw = anchor.get("momentum_window", 60)
+    a_mp = anchor.get("momentum_periods", 5)
+
+    mw_choices = [30, 60, 90, 120, 180, 300]
+    mp_choices = [3, 4, 5, 6, 7, 8, 9, 10]
+    mins_choices = [10, 15, 30, 45]
+    maxs_choices = [60, 90, 120, 180, 240, 300, 480, 600]
+
+    def _nearby(choices, val, spread):
+        """Pick one of the `spread` closest values in `choices` to `val`."""
+        sorted_by_dist = sorted(choices, key=lambda c: abs(c - val))
+        return random.choice(sorted_by_dist[:spread])
+
+    for _ in range(n):
+        # 80% tight noise, 20% wider exploration — prevents getting
+        # stuck in a narrow basin if the anchor was a local only.
+        wide = random.random() < 0.2
+        buf_sigma = 0.08 if wide else 0.02
+        mom_sigma = 0.03 if wide else 0.008
+
+        mcp = max(MIN_CONTRACT_PRICE_FLOOR,
+                  min(MAX_ENTRY_PRICE_CEIL - MIN_BAND_WIDTH,
+                      a_mcp + random.choice([-1, 0, 0, 0, 1])))
+        mep = max(mcp + MIN_BAND_WIDTH,
+                  min(MAX_ENTRY_PRICE_CEIL,
+                      a_mep + random.choice([-1, 0, 0, 0, 1])))
+        buf = max(0.01, min(0.80, a_buf + random.gauss(0, buf_sigma)))
+        mom = max(-0.15, min(0.0, a_mom + random.gauss(0, mom_sigma)))
+        out.append({
+            "min_contract_price": mcp,
+            "max_entry_price": mep,
+            "min_seconds": _nearby(mins_choices, a_mins, 2 if not wide else 4),
+            "max_seconds": _nearby(maxs_choices, a_maxs, 2 if not wide else 4),
+            "min_price_buffer_pct": round(buf, 4),
+            "max_adverse_momentum": round(mom, 5),
+            "momentum_window": _nearby(mw_choices, a_mw, 2 if not wide else 4),
+            "momentum_periods": _nearby(mp_choices, a_mp, 2 if not wide else 4),
+            "max_realized_vol_pct": None,
+            "vol_lookback": VOL_LOOKBACK,
+        })
+    # Always include the anchor itself so we can see if any perturbation
+    # actually beat the starting point.
+    out.append({
+        "min_contract_price": a_mcp,
+        "max_entry_price": a_mep,
+        "min_seconds": a_mins,
+        "max_seconds": a_maxs,
+        "min_price_buffer_pct": a_buf,
+        "max_adverse_momentum": a_mom,
+        "momentum_window": a_mw,
+        "momentum_periods": a_mp,
+        "max_realized_vol_pct": None,
+        "vol_lookback": VOL_LOOKBACK,
+    })
+    return out
+
+
 def grid_params() -> list[dict]:
     combos = []
-    # Grid structured by parameter importance:
-    #   momentum × buffer = dense grid (rank #1 × #2)
-    #   time = moderate grid (rank #3)
-    #   entry band = coarse (rank #4)
-    #   vol = off (rank #5, not predictive)
-    band_choices = [
-        (90, 98), (92, 98), (93, 98), (95, 98),
-        (90, 96), (92, 96), (93, 97),
-    ]
+    # Full exhaustive sweep across every dimension within the configured
+    # bounds. Tractable now that the CUDA backend clears ~10k candidates/s
+    # on an RTX 3070 — a ~1.09M sweep finishes in ~2 min per cell.
+    # GRID_MODE=small reverts to the 107k-candidate coarse grid for CPU
+    # runs or fast smoke tests.
+    mode = os.environ.get("GRID_MODE", "full").lower()
+    if mode == "small":
+        band_choices = [
+            (90, 98), (92, 98), (93, 98), (95, 98),
+            (90, 96), (92, 96), (93, 97),
+        ]
+        time_choices = [(10, 90), (10, 180), (10, 300),
+                        (15, 60), (15, 120), (30, 180),
+                        (30, 300), (45, 90), (45, 600)]
+    else:
+        band_choices = [
+            (mcp, mep)
+            for mep in (96, 97, 98)
+            for mcp in range(MIN_CONTRACT_PRICE_FLOOR, mep - MIN_BAND_WIDTH + 1)
+        ]
+        time_choices = [
+            (mins, ms)
+            for mins in (10, 15, 30, 45)
+            for ms in (60, 90, 120, 180, 240, 300, 480, 600)
+            if mins < ms
+        ]
     for mcp, mep in band_choices:
-        for mins, ms in [(10, 90), (10, 180), (10, 300),
-                         (15, 60), (15, 120), (30, 180),
-                         (30, 300), (45, 90), (45, 600)]:
-            # Buffer: dense search (rank #2)
+        for mins, ms in time_choices:
             for buf in [0.05, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]:
-                # Momentum: dense search (rank #1)
                 for mom in [-0.10, -0.08, -0.06, -0.04, -0.03,
                             -0.02, -0.01, -0.005, 0.0]:
-                    combos.append({
-                        "min_contract_price": mcp,
-                        "max_entry_price": mep,
-                        "min_seconds": mins,
-                        "max_seconds": ms,
-                        "min_price_buffer_pct": buf,
-                        "max_adverse_momentum": mom,
-                        "momentum_window": 60,
-                        "momentum_periods": 5,
-                        "max_realized_vol_pct": None,
-                        "vol_lookback": VOL_LOOKBACK,
-                    })
+                    for mw in (30, 60, 90, 120, 180, 300):
+                        for mp in (3, 4, 5, 6, 7, 8, 9, 10):
+                            combos.append({
+                                "min_contract_price": mcp,
+                                "max_entry_price": mep,
+                                "min_seconds": mins,
+                                "max_seconds": ms,
+                                "min_price_buffer_pct": buf,
+                                "max_adverse_momentum": mom,
+                                "momentum_window": mw,
+                                "momentum_periods": mp,
+                                "max_realized_vol_pct": None,
+                                "vol_lookback": VOL_LOOKBACK,
+                            })
     return combos
 
 
@@ -901,7 +988,10 @@ def preprocess_window(window: dict, crypto_prices: dict) -> Optional[dict]:
 
 
 def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
-    """Fast simulation against pre-processed entries."""
+    """Fast simulation against pre-processed entries.
+    Python loop with early-exit is net faster than numpy here — each
+    window has only ~30-50 entries, and numpy's per-call overhead
+    exceeds the cost of a Python short-circuiting scan at that size."""
     min_cp = params["min_contract_price"]
     max_ep = params["max_entry_price"]
     min_secs = params.get("min_seconds", 10)
@@ -916,8 +1006,6 @@ def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
         if e["secs_left"] < min_secs or e["secs_left"] > max_secs:
             continue
 
-        # Realized-volatility filter (None = disabled for this candidate).
-        # Mirrors resolution_rider.evaluate exactly.
         if max_vol is not None and e["realized_vol"] is not None:
             if e["realized_vol"] > max_vol:
                 continue
@@ -926,15 +1014,6 @@ def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
         if e["entry_price"] < min_cp or e["entry_price"] > max_ep:
             continue
 
-        # Buffer — time-scaled. The optimizer searches min_buffer as a
-        # "base" value expressed at 60 seconds remaining; the effective
-        # required buffer at any secs_left scales with sqrt(secs_left/60),
-        # mirroring Brownian-motion residual vol. This lets a single
-        # `min_price_buffer_pct` setting correctly gate both early-in-
-        # window entries (where lots of vol remains) and late ones (where
-        # little remains), which a flat threshold could not do — the flat
-        # version either rejected all early entries or passed all late
-        # ones regardless of risk.
         if e["buffer_pct"] is not None:
             time_scale = math.sqrt(max(1.0, e["secs_left"]) / 60.0)
             required = min_buffer * time_scale
@@ -943,7 +1022,6 @@ def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
             if e["side"] == "no" and e["buffer_pct"] > -required:
                 continue
 
-        # Momentum
         if max_mom < 0 and e["momentum"]:
             mom = e["momentum"].get(mom_key)
             if mom is not None:
@@ -955,7 +1033,6 @@ def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
         won = (e["side"] == result)
         contracts = max(1, int(10.0 / (e["entry_price"] / 100.0)))
         stake = contracts * e["entry_price"] / 100.0
-        # Apply slippage penalty from empirical Kalshi fill data
         slippage_per_contract = get_slippage_cents(int(e["entry_price"])) / 100.0
         slippage_cost = contracts * slippage_per_contract
         if won:
@@ -1119,9 +1196,19 @@ def _cv_score_candidate(params: dict):
         avg_loss = -avg_stake
     safe_ppt = wr_lb * avg_win + (1 - wr_lb) * avg_loss
 
+    # Compact fold summary for downstream code: flat numpy array,
+    # columns [val_trades, val_profit, train_profit]. Matches the format
+    # returned by optimize_rr_cuda.score_candidates — main() reads these
+    # via numpy indexing, avoiding per-fold dict allocations that OOM'd
+    # the GPU path at multi-million-candidate scale.
+    compact_folds = np.empty((len(fold_results), 3), dtype=np.float64)
+    for i, f in enumerate(fold_results):
+        compact_folds[i, 0] = f["val"]["trades"]
+        compact_folds[i, 1] = f["val"]["profit"]
+        compact_folds[i, 2] = f["train"]["profit"]
     return (
         wr_lb, val_wr, total_val_losses, total_val_trades,
-        train_wr, total_train_trades, params, fold_results,
+        train_wr, total_train_trades, params, compact_folds,
         safe_ppt, total_val_profit,
     )
 
@@ -1358,11 +1445,40 @@ def main():
     all_cells = sorted(windows_by_cell.keys())
     print(f"  {len(all_cells)} cells: {', '.join(all_cells)}")
 
+    # Eager global preprocessing. Raw windows carry a `ticks` list that
+    # averages ~100KB/window for live-recorded 15M markets; with 197k
+    # windows that's ~20GB of tick data sitting in windows_by_cell while
+    # early cells run. Preprocessing up-front + dropping the raw ticks
+    # leaves a ~10KB entries list per window (~2GB global), which is
+    # the single biggest RAM reduction we can get without streaming the
+    # dataset from disk. preprocess_window is ~fast (a few minutes for
+    # 200k windows) vs. many hours lost to OOMs. pp is stashed on the
+    # same dict so the per-cell loop can pick it up by identity.
+    import gc
+    print("  Pre-processing all windows globally (frees raw ticks)...")
+    t_pp = time.time()
+    n_tradeable = 0
+    for cell in all_cells:
+        for w in windows_by_cell[cell]:
+            pp = preprocess_window(w, crypto_prices)
+            if pp is not None:
+                w["_pp"] = pp
+                n_tradeable += 1
+            # Raw ticks no longer needed — freed even if pp was None
+            # so non-tradeable windows don't hog memory either.
+            w.pop("ticks", None)
+    # Drop the flat master list; windows_by_cell still holds everything.
+    all_windows = None
+    gc.collect()
+    print(f"  {n_tradeable:,}/{sum(len(v) for v in windows_by_cell.values()):,} "
+          f"have tradeable ticks (preprocessed in {time.time()-t_pp:.0f}s)")
+
     # Get unique dates for k-fold (use the combined window set)
     all_dates = sorted(set(
         w["close_time"].strftime("%Y-%m-%d") if hasattr(w["close_time"], "strftime")
         else str(w["close_time"])[:10]
-        for w in all_windows
+        for windows in windows_by_cell.values()
+        for w in windows
     ))
     print(f"  {len(all_dates)} distinct dates (showing first/last 3): "
           f"{', '.join(all_dates[:3])} ... {', '.join(all_dates[-3:])}")
@@ -1371,7 +1487,11 @@ def main():
     results = {}
     for cell in all_cells:
         print(f"\n--- {cell} ---")
-        cell_windows = windows_by_cell[cell]
+        # pop() (not []) so once this cell's tensors are on the GPU the
+        # raw-tick memory for this cell can be reclaimed by the next gc —
+        # otherwise windows_by_cell keeps ~20GB of ticks alive through
+        # every cell and OOMs on large sweeps.
+        cell_windows = windows_by_cell.pop(cell)
 
         # Tag each window with its date
         dated = []
@@ -1379,25 +1499,76 @@ def main():
             d = (w["close_time"].strftime("%Y-%m-%d") if hasattr(w["close_time"], "strftime")
                  else str(w["close_time"])[:10])
             dated.append((d, w))
+        # Raw windows list is now redundant with `dated` — drop to free.
+        del cell_windows
 
-        # Pre-process ALL windows once
-        print(f"  Pre-processing {len(dated)} windows...")
+        # Reuse the globally-preprocessed pp dicts (step 2/4). This skips
+        # re-preprocessing and avoids pulling raw ticks back into memory.
         preprocessed = []
         for d, w in dated:
-            pp = preprocess_window(w, crypto_prices)
+            pp = w.get("_pp")
             if pp is not None:
                 pp["_date"] = d
                 preprocessed.append(pp)
-        print(f"  {len(preprocessed)} have tradeable ticks")
+        print(f"  {len(preprocessed)} have tradeable ticks (cached)")
 
         if len(preprocessed) < 3:
             print(f"  {cell}: not enough data, skipping")
             continue
 
-        # Generate candidates
-        candidates = grid_params()
-        for _ in range(3000):
-            candidates.append(sample_params())
+        # Generate candidates. Modes, in precedence order:
+        #   PHASE=refine    → local search around an anchor (REFINE_FROM
+        #                     file, default data/rr_params_preview.json).
+        #   ONLY_LIVE=1     → one-shot eval of the live params for this
+        #                     cell (apples-to-apples on new data).
+        #   default         → full grid + random sweep.
+        phase = os.environ.get("PHASE", "").strip().lower()
+        if phase == "refine":
+            refine_file = os.environ.get("REFINE_FROM", "data/rr_params_preview.json")
+            try:
+                _anchors = json.load(open(refine_file))
+            except Exception as e:
+                print(f"  PHASE=refine: couldn't load {refine_file}: {e}")
+                continue
+            anchor = _anchors.get(cell)
+            if anchor is None:
+                print(f"  {cell}: no anchor in {refine_file}, skipping")
+                continue
+            n_refine = int(os.environ.get("N_REFINE", "50000"))
+            candidates = perturb_around(anchor, n_refine)
+            print(f"  PHASE=refine: {n_refine} perturbations around anchor "
+                  f"(buf={anchor['min_price_buffer_pct']}%, "
+                  f"mom={anchor['max_adverse_momentum']}, "
+                  f"mw{anchor.get('momentum_window')}/mp{anchor.get('momentum_periods')})")
+        elif os.environ.get("ONLY_LIVE", "0") == "1":
+            try:
+                _live_all = json.load(open("data/rr_params.json"))
+            except Exception as e:
+                print(f"  ONLY_LIVE set but couldn't load rr_params.json: {e}")
+                continue
+            live_p = _live_all.get(cell)
+            if live_p is None:
+                print(f"  {cell}: no live entry, skipping")
+                continue
+            # Strip the non-param bookkeeping fields; keep only the tunable
+            # dims the scorer needs.
+            keep = {
+                "min_contract_price", "max_entry_price",
+                "min_seconds", "max_seconds",
+                "min_price_buffer_pct", "max_adverse_momentum",
+                "momentum_window", "momentum_periods",
+                "max_realized_vol_pct", "vol_lookback",
+            }
+            candidates = [{k: live_p[k] for k in keep if k in live_p}]
+            # Defaults for any missing optional fields.
+            candidates[0].setdefault("min_seconds", 10)
+            candidates[0].setdefault("vol_lookback", VOL_LOOKBACK)
+            candidates[0].setdefault("max_realized_vol_pct", None)
+        else:
+            candidates = grid_params()
+            n_random = int(os.environ.get("N_RANDOM", "50000"))
+            for _ in range(n_random):
+                candidates.append(sample_params())
 
         unique_dates = sorted(set(pp["_date"] for pp in preprocessed))
         N = len(unique_dates)
@@ -1486,28 +1657,89 @@ def main():
         # per task. Chunksize=50 balances IPC overhead against worker
         # starvation; on 5700 candidates × 10 folds, this gives ~4-8×
         # speedup over the serial loop.
-        n_workers = max(1, (os.cpu_count() or 4) - 1)
-        chunksize = max(10, len(candidates) // (n_workers * 20))
-        print(f"    parallelizing {len(candidates)} candidates across {n_workers} workers "
-              f"(chunksize={chunksize})...")
-
-        candidate_scores = []
+        # Worker count: default cpu_count()-1. Smaller grids tolerate more
+        # workers without OOM since worker-page drift scales with total
+        # candidates processed. Override with N_WORKERS env to force a
+        # specific count (useful when testing larger grids).
+        backend = os.environ.get("BACKEND", "cpu").strip().lower()
         t_cv_start = time.time()
-        with multiprocessing.Pool(
-            n_workers,
-            initializer=_cv_worker_init,
-            initargs=(pp_by_bucket, train_sets),
-        ) as pool:
-            for i, result in enumerate(pool.imap_unordered(
-                _cv_score_candidate, candidates, chunksize=chunksize,
-            )):
-                if result is not None:
-                    candidate_scores.append(result)
-                if (i + 1) % 1000 == 0:
+        candidate_scores = []
+
+        if backend == "cuda":
+            # GPU path — evaluate candidates in batches on the GPU. Single
+            # process, no multiprocessing.Pool. Tensor build-up amortizes
+            # across the whole candidate sweep for this cell.
+            import optimize_rr_cuda as orc
+            if not orc.is_available():
+                print("  [cuda] torch.cuda not available, falling back to CPU")
+                backend = "cpu"
+            else:
+                batch_size = int(os.environ.get("CUDA_BATCH_SIZE", "2048"))
+                print(f"    [cuda] building cell tensors for {len(pp_by_bucket)} folds...")
+                t_build = time.time()
+                cell_tensors = orc.build_cell_tensors(pp_by_bucket, train_sets)
+                print(f"    [cuda] built in {time.time() - t_build:.1f}s "
+                      f"(E={cell_tensors['E']:,} entries, W={cell_tensors['W']:,} windows)")
+
+                def _progress(done: int, total: int):
                     elapsed = time.time() - t_cv_start
-                    rate = (i + 1) / elapsed
-                    eta = (len(candidates) - (i + 1)) / rate if rate > 0 else 0
-                    print(f"    {i + 1}/{len(candidates)}  ({rate:.0f}/s, ETA {eta:.0f}s)")
+                    rate = done / elapsed if elapsed > 0 else 0
+                    eta = (total - done) / rate if rate > 0 else 0
+                    print(f"    [cuda] {done}/{total}  ({rate:.0f}/s, ETA {eta:.0f}s)")
+
+                # Drop CPU-side preprocessed dicts — the GPU tensors are
+                # the source of truth for scoring. Holding 10-60k dicts
+                # per cell in RAM was the 2nd biggest contributor to the
+                # OOM on the 2.6M-candidate sweep.
+                import gc
+                pp_by_bucket.clear()
+                train_sets.clear()
+                preprocessed.clear()
+                gc.collect()
+
+                cuda_results = orc.score_candidates(
+                    cell_tensors, candidates,
+                    get_slippage_cents_fn=get_slippage_cents,
+                    wilson_lower_bound_fn=wilson_lower_bound,
+                    min_val_trades_per_fold=MIN_VAL_TRADES_PER_FOLD,
+                    min_total_val_trades=MIN_TOTAL_VAL_TRADES,
+                    recency_halflife_folds=RECENCY_HALFLIFE_FOLDS,
+                    batch_size=batch_size,
+                    progress_fn=_progress,
+                )
+                candidate_scores = [r for r in cuda_results if r is not None]
+                # Free cell tensors + candidate list before next cell.
+                del cell_tensors, cuda_results
+                candidates.clear()
+                import torch
+                torch.cuda.empty_cache()
+                gc.collect()
+
+        if backend != "cuda":
+            env_workers = os.environ.get("N_WORKERS", "").strip()
+            if env_workers.isdigit() and int(env_workers) > 0:
+                n_workers = int(env_workers)
+            else:
+                n_workers = max(1, (os.cpu_count() or 4) - 1)
+            chunksize = max(10, len(candidates) // (n_workers * 20))
+            print(f"    parallelizing {len(candidates)} candidates across {n_workers} workers "
+                  f"(chunksize={chunksize})...")
+            with multiprocessing.Pool(
+                n_workers,
+                initializer=_cv_worker_init,
+                initargs=(pp_by_bucket, train_sets),
+            ) as pool:
+                for i, result in enumerate(pool.imap_unordered(
+                    _cv_score_candidate, candidates, chunksize=chunksize,
+                )):
+                    if result is not None:
+                        candidate_scores.append(result)
+                    if (i + 1) % 1000 == 0:
+                        elapsed = time.time() - t_cv_start
+                        rate = (i + 1) / elapsed
+                        eta = (len(candidates) - (i + 1)) / rate if rate > 0 else 0
+                        print(f"    {i + 1}/{len(candidates)}  ({rate:.0f}/s, ETA {eta:.0f}s)")
+
         print(f"    CV done in {time.time() - t_cv_start:.0f}s "
               f"({len(candidate_scores)} viable candidates)")
 
@@ -1541,9 +1773,10 @@ def main():
          p, folds, safe_ppt, _) = best
         comp_score = _composite(best)
 
-        val_profit = sum(f["val"]["profit"] for f in folds)
-        train_profit = sum(f["train"]["profit"] for f in folds)
-        min_fold_trades = min(f["val"]["trades"] for f in folds)
+        # `folds` is now a numpy (n_folds, 3) array: [val_trades, val_profit, train_profit]
+        val_profit = float(folds[:, 1].sum())
+        train_profit = float(folds[:, 2].sum())
+        min_fold_trades = int(folds[:, 0].min())
         safe_total = safe_ppt * val_trades
 
         results[cell] = {
@@ -1577,17 +1810,32 @@ def main():
               f"p={p.get('momentum_periods', 5)}), {vol_str}")
 
     print("\n[4/4] Saving...")
-    out = Path("data/rr_params.json")
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    # Back up previous params with timestamp
-    if out.exists():
-        from datetime import datetime
-        ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        backup = out.parent / f"rr_params_{ts}.json"
-        import shutil
-        shutil.copy2(out, backup)
-        print(f"  Backed up previous params to {backup}")
+    phase = os.environ.get("PHASE", "").strip().lower()
+    only_live_mode = os.environ.get("ONLY_LIVE", "0") == "1"
+    preview_mode = os.environ.get("PREVIEW", "").strip() not in ("", "0", "false", "False")
+    if phase == "refine":
+        out = Path("data/rr_params_refined.json")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        print(f"  PHASE=refine — saving to {out} (compare to preview before deploying)")
+    elif only_live_mode:
+        out = Path("data/rr_params_live_on_new_data.json")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        print(f"  ONLY_LIVE mode — saving to {out} (not overwriting anything)")
+    elif preview_mode:
+        out = Path("data/rr_params_preview.json")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        print(f"  PREVIEW mode — live rr_params.json will NOT be touched")
+    else:
+        out = Path("data/rr_params.json")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # Back up previous params with timestamp
+        if out.exists():
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            backup = out.parent / f"rr_params_{ts}.json"
+            import shutil
+            shutil.copy2(out, backup)
+            print(f"  Backed up previous params to {backup}")
 
     with open(out, "w") as f:
         json.dump(results, f, indent=2, default=str)
