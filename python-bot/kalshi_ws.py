@@ -151,10 +151,24 @@ class KalshiWebSocket:
         with self._lock:
             return dict(self._ticks)
 
+    # Kalshi's `ticker` channel is trade-keyed: it pushes on trades and
+    # summary-field changes, but not on every new bid/ask. So a market
+    # that hasn't traded in a minute may have a WS tick that's minutes
+    # old even though the book is currently moving. REST `/markets`
+    # refreshes every 3s in the scanner with authoritative yes_bid/ask,
+    # so once the WS tick is older than ~5s the REST value is almost
+    # certainly fresher. Tighter threshold = fewer stale gate
+    # decisions (2026-04-22: was 30s; dropped to 5s to stop letting
+    # minute-old WS ticks win against 3s-old REST data).
+    _WS_MAX_AGE_S = float(os.getenv("WS_YES_PRICES_MAX_AGE_S", "5"))
+
     def get_yes_prices(self, ticker: str) -> tuple[Optional[int], Optional[int]]:
-        """Get (yes_bid, yes_ask) in cents, or (None, None) if no data."""
+        """Get (yes_bid, yes_ask) in cents, or (None, None) if no data
+        OR the last tick is older than `_WS_MAX_AGE_S`. Returning None
+        makes `parse_yes_price` fall through to the scanner's REST-
+        fetched market dict, which is at most ~3s old."""
         tick = self.get_tick(ticker)
-        if tick is None or time.time() - tick.ts > 30:
+        if tick is None or time.time() - tick.ts > self._WS_MAX_AGE_S:
             return None, None
         return tick.yes_bid, tick.yes_ask
 

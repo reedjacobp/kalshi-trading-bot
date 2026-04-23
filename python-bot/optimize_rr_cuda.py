@@ -34,7 +34,8 @@ def _build_slippage_table(get_slippage_cents_fn, device):
     return table
 
 
-def build_cell_tensors(pp_by_bucket, train_sets, device: str = "cuda"):
+def build_cell_tensors(pp_by_bucket, train_sets, device: str = "cuda",
+                       maker_timeouts: tuple = ()):
     """Flatten all UNIQUE windows in the cell into a single GPU layout.
     Each window appears once; per-fold membership is stored in two
     (n_folds, W) bool matrices so a window that lives in 7 training
@@ -43,6 +44,11 @@ def build_cell_tensors(pp_by_bucket, train_sets, device: str = "cuda"):
     Windows are identified by their object id — pp_by_bucket[f] and
     train_sets[f] share the same dict objects that came out of
     preprocess_window().
+
+    When `maker_timeouts` is non-empty, also builds per-entry forward-
+    window min-ask and max-bid tensors (shape (len(maker_timeouts), E)),
+    so the maker-fill check can be vectorized across all candidates
+    inside `score_candidates`. Pass `()` to skip (taker-only run).
     """
     import torch
 
@@ -108,9 +114,16 @@ def build_cell_tensors(pp_by_bucket, train_sets, device: str = "cuda"):
 
     NAN = float("nan")
     offset = 0
+    # Parallel per-entry maker arrays (only populated if maker_timeouts given).
+    # Shape at the end: (len(maker_timeouts), E). Each row is one timeout
+    # value; each column is one entry's forward-window min-ask / max-bid.
+    maker_ask_rows: list[list[int]] = [[] for _ in maker_timeouts]
+    maker_bid_rows: list[list[int]] = [[] for _ in maker_timeouts]
     for w_id, pp in enumerate(unique):
         window_start.append(offset)
         window_result.append(1 if pp["result"] == "yes" else 0)
+        maker_ask_w = pp.get("maker_ask_by_timeout", {}) if maker_timeouts else {}
+        maker_bid_w = pp.get("maker_bid_by_timeout", {}) if maker_timeouts else {}
         for pos, e in enumerate(pp["entries"]):
             all_secs.append(float(e["secs_left"]))
             all_entry_px.append(float(e["entry_price"]))
@@ -126,13 +139,36 @@ def build_cell_tensors(pp_by_bucket, train_sets, device: str = "cuda"):
             for k in mom_keys_list:
                 v = m.get(k)
                 mom_arrays[k].append(NAN if v is None else float(v))
+            if maker_timeouts:
+                si = e.get("stream_idx", 0)
+                for ti, to in enumerate(maker_timeouts):
+                    # Fall back to entry_price (no-fill) if a timeout is
+                    # missing — shouldn't happen in practice since
+                    # preprocess_window always populates the configured
+                    # set, but guards against partial data in old caches.
+                    a_arr = maker_ask_w.get(to)
+                    b_arr = maker_bid_w.get(to)
+                    if a_arr is not None and si < len(a_arr):
+                        maker_ask_rows[ti].append(int(a_arr[si]))
+                    else:
+                        maker_ask_rows[ti].append(int(e["entry_price"]))
+                    if b_arr is not None and si < len(b_arr):
+                        maker_bid_rows[ti].append(int(b_arr[si]))
+                    else:
+                        # Conservative fallback: use the tick's own yes_bid
+                        # derived from entry_price via side. Close enough
+                        # since we just want "no fill" for missing data.
+                        derived_bid = (100 - int(e["entry_price"])
+                                       if e["side"] == "no"
+                                       else int(e["entry_price"]) - 1)
+                        maker_bid_rows[ti].append(max(0, derived_bid))
             offset += 1
     E = offset
 
     def _t(data, dtype):
         return torch.tensor(data, dtype=dtype, device=device_t)
 
-    return {
+    out = {
         "E": E,
         "W": W,
         "n_folds": n_folds,
@@ -151,7 +187,13 @@ def build_cell_tensors(pp_by_bucket, train_sets, device: str = "cuda"):
         "is_train": is_train,  # (n_folds, W)
         "is_val": is_val,      # (n_folds, W)
         "device": device_t,
+        "maker_timeouts": tuple(maker_timeouts),
     }
+    if maker_timeouts:
+        # (T, E) tensors for vectorized per-candidate timeout lookup.
+        out["maker_ask"] = _t(maker_ask_rows, torch.float32)
+        out["maker_bid"] = _t(maker_bid_rows, torch.float32)
+    return out
 
 
 def score_candidates(
@@ -167,13 +209,24 @@ def score_candidates(
 ) -> list[Optional[tuple]]:
     """Score every candidate, returning a list of tuples whose shape
     matches _cv_score_candidate. None for candidates that fail the
-    per-fold / total-trade gates."""
+    per-fold / total-trade gates.
+
+    Candidates carry `order_mode` ('taker' or 'maker'). Taker fills at
+    the observed entry price with fees+slippage; maker posts a bid
+    `maker_bid_offset` cents below the ask and only fills when the
+    precomputed forward-window min-ask (or max-bid, for NO) crosses
+    the bid within `maker_timeout` seconds. We run the whole batch
+    under the SAME mode (optimize_rr.main() ensures this because
+    ORDER_MODE is a global env flag) — mixing modes in one batch
+    is not supported.
+    """
     import torch
 
     device = cell_tensors["device"]
     E = cell_tensors["E"]
     W = cell_tensors["W"]
     n_folds = cell_tensors["n_folds"]
+    maker_timeouts = cell_tensors.get("maker_timeouts", ())
 
     slip_table = _build_slippage_table(get_slippage_cents_fn, device)
 
@@ -231,6 +284,33 @@ def score_candidates(
         )
         mask &= ~reject_buf
 
+        # Maker mode: additional rejection when the resting bid would
+        # not have been matched by the market within maker_timeout.
+        # Entire batch is same mode (see docstring), so one branch check.
+        is_maker_batch = batch and batch[0].get("order_mode") == "maker"
+        if is_maker_batch and maker_timeouts and "maker_ask" in cell_tensors:
+            offsets = torch.tensor(
+                [p.get("maker_bid_offset", 0) for p in batch],
+                dtype=torch.float32, device=device,
+            ).unsqueeze(1)  # (K, 1)
+            to_idx_per_cand = torch.tensor(
+                [maker_timeouts.index(p.get("maker_timeout", maker_timeouts[0]))
+                 for p in batch],
+                dtype=torch.long, device=device,
+            )
+            # (T, E) → (K, E) via index_select on the timeout dim.
+            ask_ke = cell_tensors["maker_ask"].index_select(0, to_idx_per_cand)
+            bid_ke = cell_tensors["maker_bid"].index_select(0, to_idx_per_cand)
+            bid_price_ke = entry_px_e - offsets  # (K, E)
+            bid_price_ke = bid_price_ke.clamp(min=1.0)  # can't bid below 1c
+            # YES maker fills when the future min ask touches the bid.
+            yes_fill = side_yes_e & (ask_ke <= bid_price_ke)
+            # NO maker bid at P translates to a YES-ask at 100-P;
+            # filled when someone puts up yes_bid ≥ 100 - P.
+            no_fill = (~side_yes_e) & (bid_ke >= (100.0 - bid_price_ke))
+            maker_fill = yes_fill | no_fill
+            mask &= maker_fill
+
         key_to_idxs: dict[tuple[int, int], list[int]] = {}
         for i, p in enumerate(batch):
             key = (p.get("momentum_window", 60), p.get("momentum_periods", 5))
@@ -267,12 +347,23 @@ def score_candidates(
         global_idx = window_start.unsqueeze(0) + first_pos.to(torch.int64)
         global_idx = torch.where(has_match, global_idx, torch.zeros_like(global_idx))
         flat = global_idx.view(-1)
-        match_price = cell_tensors["entry_px"].index_select(0, flat).view(K, W)
+        match_entry_px = cell_tensors["entry_px"].index_select(0, flat).view(K, W)
         match_side_yes = cell_tensors["side_yes"].index_select(0, flat).view(K, W)
+
+        # Maker execution price is the resting bid (entry_px - offset);
+        # taker execution price is the observed ask (entry_px unchanged).
+        if is_maker_batch:
+            match_price = (match_entry_px - offsets).clamp(min=1.0)
+        else:
+            match_price = match_entry_px
 
         contracts = torch.clamp(torch.floor(1000.0 / match_price.clamp(min=1.0)), min=1.0)
         stake_kw = contracts * match_price / 100.0
-        slip = contracts * slip_table[match_price.clamp(min=0.0, max=100.0).long()]
+        # Maker fills pay no fee and no slippage (we're the price-setter).
+        if is_maker_batch:
+            slip = torch.zeros_like(match_price)
+        else:
+            slip = contracts * slip_table[match_price.clamp(min=0.0, max=100.0).long()]
         win_profit_kw = contracts * (100.0 - match_price) / 100.0 - slip
         loss_profit_kw = -contracts * match_price / 100.0 - slip
         won = has_match & (match_side_yes == window_result.unsqueeze(0))

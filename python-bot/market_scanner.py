@@ -6,6 +6,7 @@ Provides helpers to find the current open market, the most recently
 settled market, and upcoming markets.
 """
 
+import os
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -18,6 +19,31 @@ class MarketScanner:
 
     _scanner_count = 0  # Class-level counter for staggering cache expiry
 
+    # Per-status cache TTL. "open" markets move fast — need fresh data
+    # for the RR gate to fire on emergent 94c+ setups. "settled" and
+    # other statuses rarely change post-close, so a longer TTL keeps
+    # reconcile / settlement-tracking REST load low.
+    #
+    # 2026-04-22: _CACHE_TTL_OPEN_S bumped 3 → 8 → 20 → 60. Empirical
+    # Kalshi cap on the /markets endpoint for our key is ≤ 0.3 req/s
+    # (tighter than the documented 20/s reads cap). At 14 scanners,
+    # 60s TTL gives ~0.23/s, under the observed cap. WS continues to
+    # feed live book updates per-ticker at sub-second latency, so
+    # reaction speed for already-tracked markets is unchanged — only
+    # the latency to discover a newly-opened market grows from 20s
+    # to 60s (still <7% of a 15M market cycle).
+    # Env override: set SCANNER_OPEN_TTL_S to change without a rebuild.
+    _CACHE_TTL_OPEN_S = int(os.getenv("SCANNER_OPEN_TTL_S", "60"))
+    # Settled-status TTL: settled markets are immutable, and `_tick` was
+    # calling `get_last_settled_market()` on every scanner every tick.
+    # With 14 scanners and 30s TTL that was 14/30 = 0.47/s on /markets
+    # ?status=settled — combined with 0.23/s for status=open this put
+    # us over Kalshi's endpoint cap and drove the 35/min 429 rate
+    # that the OPEN TTL bump alone couldn't fix. 300s = 5min is fine;
+    # a new settlement only matters for reconcile/P&L which has other
+    # paths. Env override: SCANNER_SETTLED_TTL_S.
+    _CACHE_TTL_DEFAULT_S = int(os.getenv("SCANNER_SETTLED_TTL_S", "300"))
+
     def __init__(self, client: KalshiClient, series: str = "KXBTC15M",
                  ws_feed=None):
         self.client = client
@@ -25,33 +51,69 @@ class MarketScanner:
         self.ws_feed = ws_feed  # KalshiWebSocket for real-time prices
         self._cache = {}
         self._cache_ts = {}   # per-key timestamps
-        self._cache_ttl = 60  # seconds — fast RR uses WS, REST is just for discovery/settlement
-        # Stagger initial cache timestamps so scanners don't all expire at once
+        self._offset_applied: set = set()
+        # Assign a stable per-instance index so per-cache-key offsets
+        # can be computed later using the right TTL. A single offset
+        # is wrong because open (TTL=60) and settled (TTL=300) need
+        # different spacing — 4.3s between open refreshes but 21.4s
+        # between settled, otherwise settled bunches into a 60s window
+        # within a 300s TTL and bursts every 5 min.
         MarketScanner._scanner_count += 1
-        self._cache_offset = MarketScanner._scanner_count * 4  # 4s apart
+        self._scanner_idx = MarketScanner._scanner_count
 
-    def _fresh_markets(self, status: str = None, limit: int = 200) -> list:
-        """Fetch markets from the API, with a per-key TTL cache.
-        Cache expiry is staggered across scanner instances to avoid
-        bursting 14 scanners' worth of REST calls simultaneously."""
+    def _fresh_markets(self, status: str = None, limit: int = 500) -> list:
+        """Fetch ALL markets matching the filter, paginating via cursor.
+
+        Previous behavior truncated at the first `limit` markets because
+        the response cursor was ignored. For series like KXBTCD that
+        have many strikes open simultaneously (multiple event windows ×
+        multiple strikes each), truncation silently hid entries from
+        the RR gate — the exact "missing trades due to code issues"
+        category we cannot tolerate.
+
+        TTL is status-aware: 3s for "open" (fast-moving), 30s otherwise.
+        Pagination uses the API's cursor continuation to walk through
+        all pages until no cursor is returned. Worst case: a series with
+        N markets does ceil(N / limit) REST calls on cache miss.
+        """
         cache_key = f"{status}_{limit}"
         now = time.time()
         cached_ts = self._cache_ts.get(cache_key, 0)
-        # First call: pretend cache was set _offset seconds ago so each
-        # scanner's cache expires at a different time
-        if cached_ts == 0:
-            cached_ts = now - self._cache_offset
-            self._cache_ts[cache_key] = cached_ts
-        if cache_key in self._cache and (now - cached_ts) < self._cache_ttl:
+        ttl = (self._CACHE_TTL_OPEN_S if status == "open"
+               else self._CACHE_TTL_DEFAULT_S)
+        if cache_key in self._cache and cached_ts > 0 and (now - cached_ts) < ttl:
             return self._cache[cache_key]
 
-        result = self.client.get_markets(
-            series_ticker=self.series, status=status, limit=limit
-        )
-        markets = result.get("markets", [])
-        self._cache[cache_key] = markets
-        self._cache_ts[cache_key] = now
-        return markets
+        all_markets: list = []
+        cursor: Optional[str] = None
+        page_count = 0
+        max_pages = 20  # safety ceiling — 20 × 500 = 10k markets
+        while page_count < max_pages:
+            result = self.client.get_markets(
+                series_ticker=self.series, status=status, limit=limit,
+                cursor=cursor,
+            )
+            page = result.get("markets", [])
+            all_markets.extend(page)
+            page_count += 1
+            cursor = result.get("cursor")
+            if not cursor or not page:
+                break
+        self._cache[cache_key] = all_markets
+        # On the first fetch per cache_key, apply a per-TTL stagger so
+        # 14 scanners' refreshes spread evenly across the full TTL
+        # window for this cache_key — open over 60s, settled over 300s.
+        # The prior code used a single 0-60s offset for both, which
+        # bunched settled refreshes into a 60s window inside the 300s
+        # TTL and produced a 35 × 429/min burst every 5 minutes.
+        if cache_key not in self._offset_applied:
+            step = max(1.0, ttl / 14.0)
+            offset = (self._scanner_idx * step) % ttl
+            self._cache_ts[cache_key] = now - offset
+            self._offset_applied.add(cache_key)
+        else:
+            self._cache_ts[cache_key] = now
+        return all_markets
 
     def get_open_markets(self) -> list:
         """Get all currently open (active/tradeable) markets in this series."""

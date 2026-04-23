@@ -57,23 +57,22 @@ class ResolutionRiderStrategy(Strategy):
 
     def __init__(
         self,
-        min_contract_price: int = 95,   # Only enter at 95c+ on the favored side
-        max_entry_price: int = 98,      # 99c loses money after taker fees
-        min_seconds: int = 10,          # Don't trade in final 10s (settlement risk)
-        max_seconds: int = 60,          # Cell params override this; default is tight
-        min_price_buffer_pct: float = 0.15,  # 0.15% — safe given 60s CFB RTI averaging at settlement
-        max_adverse_momentum: float = -0.05,  # Block if smoothed trend moving toward strike faster than this
-        momentum_window: int = 60,      # Seconds per momentum reading (cell params override)
-        momentum_periods: int = 5,      # Number of readings to smooth over
-        # Realized-volatility filter: rejects entries when stddev of
-        # per-tick returns over `vol_lookback` exceeds `max_realized_vol_pct`.
-        # Catches "chop" regimes where momentum looks flat only because
-        # price oscillated through net-zero — those are riskier for
-        # 95-98c YES holds than the momentum gate alone can detect.
-        max_realized_vol_pct: Optional[float] = None,  # None = filter disabled
-        vol_lookback: int = 300,        # Seconds of price history to measure
-        kelly_fraction: float = 0.30,   # Fractional Kelly — aggressive but safe
-        max_bankroll_pct: float = 0.05, # Max 5% of bankroll per trade
+        # Heuristic defaults — applied uniformly to every cell. The live
+        # bot also overlays these onto any per-cell rr_params.json entry
+        # via HEURISTIC_PARAMS in bot.py, so optimizer output cannot
+        # produce an unsafe gate (e.g. 98c entry or sub-0.2% buffer).
+        min_contract_price: int = 94,
+        max_entry_price: int = 97,          # HARD CAP: 98c is a break-even trap
+        min_seconds: int = 10,              # Final 10s has settlement variance
+        max_seconds: int = 180,
+        min_price_buffer_pct: float = 0.15,  # Floor. Time-scaled by sqrt(t/60) below.
+        max_adverse_momentum: float = -0.04,  # Block on sustained adverse trend
+        momentum_window: int = 60,
+        momentum_periods: int = 3,
+        max_realized_vol_pct: Optional[float] = None,  # Disabled. Kept for sig compat.
+        vol_lookback: int = 300,
+        kelly_fraction: float = 0.30,
+        max_bankroll_pct: float = 0.05,
     ):
         self.min_contract_price = min_contract_price
         self.max_entry_price = max_entry_price
@@ -97,15 +96,25 @@ class ResolutionRiderStrategy(Strategy):
             max_price_cents=0,
         )
 
-        # All entry parameters come from cell_params if provided, otherwise
-        # fall back to the strategy instance defaults. This keeps the slow
-        # path, fast path, and backtest simulator in lock-step.
+        # Per-cell overrides are still read (the dashboard and optimizer
+        # code still pass them for display), but hard invariants below
+        # clamp max_entry_price and min_price_buffer_pct so a stale
+        # rr_params.json entry can never expose the bot to the 98c trap
+        # or a sub-0.15% buffer (the kind of config that cost $100 on
+        # 4/21). Invariants match the instance defaults that bot.py's
+        # HEURISTIC_PARAMS overlay applies — belt and suspenders.
         cp = cell_params or {}
         min_cp = cp.get("min_contract_price", self.min_contract_price)
-        max_ep = cp.get("max_entry_price", self.max_entry_price)
+        max_ep = min(cp.get("max_entry_price", self.max_entry_price), 97)
         min_secs = cp.get("min_seconds", self.min_seconds)
         max_secs = cp.get("max_seconds", self.max_seconds)
-        min_buf = cp.get("min_price_buffer_pct", self.min_price_buffer_pct)
+        # Floor lowered 0.15 → 0.10 on 2026-04-23 to get more setups through
+        # for cells whose trained buffers are well below 0.10 (eth_hourly,
+        # xrp_hourly, doge_15m, etc.). 0.10% is still 5× the 0.021% that
+        # caused the original eth_hourly disaster, so the catastrophic-
+        # buffer protection stays intact. Cells with trained buffers
+        # ≥ 0.10 are unaffected by this change.
+        min_buf = max(cp.get("min_price_buffer_pct", self.min_price_buffer_pct), 0.10)
         max_adv_mom = cp.get("max_adverse_momentum", self.max_adverse_momentum)
         mom_window = cp.get("momentum_window", self.momentum_window)
         mom_periods = cp.get("momentum_periods", self.momentum_periods)

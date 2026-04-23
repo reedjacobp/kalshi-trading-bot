@@ -35,7 +35,7 @@ class TestRetryLogic(unittest.TestCase):
         success_resp.json.return_value = {"markets": []}
         success_resp.raise_for_status = MagicMock()
 
-        client.session.get.side_effect = [
+        client.session.request.side_effect = [
             ConnectionError("Connection reset"),
             ConnectionError("Connection reset"),
             success_resp,
@@ -43,16 +43,16 @@ class TestRetryLogic(unittest.TestCase):
 
         result = client._public_get("/markets")
         self.assertEqual(result, {"markets": []})
-        self.assertEqual(client.session.get.call_count, 3)
+        self.assertEqual(client.session.request.call_count, 3)
 
     @patch("kalshi_client.time.sleep")
     def test_public_get_raises_after_3_failures(self, mock_sleep):
         client = self._make_client()
-        client.session.get.side_effect = Timeout("Timed out")
+        client.session.request.side_effect = Timeout("Timed out")
 
         with self.assertRaises(Timeout):
             client._public_get("/markets")
-        self.assertEqual(client.session.get.call_count, 3)
+        self.assertEqual(client.session.request.call_count, 3)
 
     @patch("kalshi_client.time.sleep")
     def test_public_get_no_retry_on_client_error(self, mock_sleep):
@@ -64,11 +64,11 @@ class TestRetryLogic(unittest.TestCase):
             response=error_resp
         )
 
-        client.session.get.return_value = error_resp
+        client.session.request.return_value = error_resp
 
         with self.assertRaises(requests.exceptions.HTTPError):
             client._public_get("/markets")
-        self.assertEqual(client.session.get.call_count, 1)
+        self.assertEqual(client.session.request.call_count, 1)
 
     @patch("kalshi_client.time.sleep")
     def test_request_retries_on_server_error(self, mock_sleep):
@@ -104,11 +104,11 @@ class TestRetryLogic(unittest.TestCase):
         success_resp.json.return_value = {"markets": []}
         success_resp.raise_for_status = MagicMock()
 
-        client.session.get.side_effect = [rate_limited_resp, success_resp]
+        client.session.request.side_effect = [rate_limited_resp, success_resp]
 
         result = client._public_get("/markets")
         self.assertEqual(result, {"markets": []})
-        self.assertEqual(client.session.get.call_count, 2)
+        self.assertEqual(client.session.request.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -202,6 +202,23 @@ function tickerWindowLabel(ticker: string): string {
 
 type Gate = { k: string; v: string; ref: string; ok: boolean };
 
+// Cell-level status: whether the bot's scanner is even willing to
+// evaluate per-trade gates for this cell. A cell can be "missing" (not in
+// rr_params.json at all) or "disabled" (present but failed the CV
+// safety gate in bot.py:evaluate_cell_safety). In both cases the
+// scanner bumps `no_cell` and never reaches the per-trade checks — so
+// the gate checklist below is effectively cosmetic until the cell is
+// enabled. Surfacing this up front prevents the "all gates green but no
+// trades" confusion from 2026-04-20.
+type CellState = {
+  name: string;
+  enabled: boolean;
+  reason: string | null;  // human-readable when disabled/missing, else null
+  missing: boolean;       // true = no entry in rr_config.per_cell at all
+};
+
+type GatePanel = { cell: CellState; gates: Gate[] };
+
 // Map an asset key (e.g. "btc", "btc_daily") to its rr_config.per_cell key.
 // 15M markets → "<coin>_15m". Daily markets → "<coin>_hourly" (the bot
 // uses the same cell name for both daily/hourly variants — bot.py:2839).
@@ -214,16 +231,54 @@ function buildGates(
   assetKey: string,
   data: TickData,
   liveSecs?: number,
-): Gate[] {
+): GatePanel {
+  const empty: GatePanel = {
+    cell: { name: cellNameFor(assetKey), enabled: false, reason: "no market data", missing: true },
+    gates: [],
+  };
   const market = data.markets[assetKey];
-  if (!market) return [];
+  if (!market) return empty;
 
-  const cell = data.rr_config?.per_cell?.[cellNameFor(assetKey)];
+  const cellName = cellNameFor(assetKey);
+  const cell = data.rr_config?.per_cell?.[cellName];
   const defaults = data.rr_config?.defaults;
   const mom = data.asset_momentum?.[assetKey];
 
+  // Cell-level safety gate. The bot publishes every cell from
+  // rr_params.json in rr_config.per_cell with an `enabled` flag and a
+  // `disabled_reason` when the CV thresholds in evaluate_cell_safety()
+  // weren't met (bot.py ~120). A missing cell means rr_params.json has
+  // no entry for this coin/timeframe at all.
+  let cellState: CellState;
+  if (!cell) {
+    cellState = {
+      name: cellName,
+      enabled: false,
+      reason: "no entry in rr_params.json — optimizer hasn't produced a cell yet",
+      missing: true,
+    };
+  } else if (cell.enabled === false) {
+    cellState = {
+      name: cellName,
+      enabled: false,
+      reason: cell.disabled_reason ?? "cell failed CV safety gate",
+      missing: false,
+    };
+  } else {
+    cellState = { name: cellName, enabled: true, reason: null, missing: false };
+  }
+
   // All price thresholds are in CENTS (matches yes_ask/yes_bid units).
-  const askCents = market.yes_ask;
+  // The bot gates on the FAVORED side's mid, not YES-ask —
+  // fav = max(yes_mid, 100 - yes_mid)  (bot.py:1551-1564).
+  // Mirror that here so YES_ask=1¢ (NO favored at 99¢) doesn't show FAIL
+  // on min_contract_price when the bot would actually pass.
+  const yesMid = (market.yes_bid + market.yes_ask) / 2;
+  const noMid = 100 - yesMid;
+  const favSide: "YES" | "NO" = yesMid >= noMid ? "YES" : "NO";
+  const favMid = Math.max(yesMid, noMid);
+  const favMidStr = `${favSide} ${favMid.toFixed(1)}¢`;
+
   const minPriceC = cell?.min_contract_price ?? defaults?.min_contract_price ?? 95;
   const maxPriceC = cell?.max_entry_price ?? defaults?.max_entry_price ?? 98;
   const minSec = cell?.min_seconds ?? defaults?.min_seconds ?? 15;
@@ -253,18 +308,31 @@ function buildGates(
     bufferPct = ((market.cap_strike - price) / market.cap_strike) * 100;
   }
 
-  return [
+  // Buffer requirement is time-scaled by sqrt(secs_left/60) in the bot
+  // (resolution_rider.required_buffer / bot.py:1588). Match that here so
+  // the dashboard's PASS/FAIL lines up with what the scanner actually does.
+  const bufReq = minBufPct * Math.sqrt(Math.max(1, sec) / 60);
+  // Favored side dictates buffer sign: YES wants price ABOVE strike
+  // (buffer_pct ≥ +req), NO wants price BELOW strike (buffer_pct ≤ -req).
+  const bufOk = bufferPct != null && (
+    favSide === "YES" ? bufferPct >= bufReq : bufferPct <= -bufReq
+  );
+  const bufRefStr = favSide === "YES"
+    ? `≥ +${bufReq.toFixed(3)}%`
+    : `≤ −${bufReq.toFixed(3)}%`;
+
+  const gates: Gate[] = [
     {
       k: "min_contract_price",
-      v: `${askCents}¢`,
+      v: favMidStr,
       ref: `≥ ${minPriceC}¢`,
-      ok: askCents >= minPriceC,
+      ok: favMid >= minPriceC,
     },
     {
       k: "max_entry_price",
-      v: `${askCents}¢`,
+      v: favMidStr,
       ref: `≤ ${maxPriceC}¢`,
-      ok: askCents <= maxPriceC,
+      ok: favMid <= maxPriceC,
     },
     {
       k: "seconds_remaining",
@@ -277,8 +345,8 @@ function buildGates(
       v: bufferPct != null
         ? `${bufferPct >= 0 ? "+" : ""}${bufferPct.toFixed(3)}%`
         : "—",
-      ref: `≥ ${minBufPct.toFixed(3)}%`,
-      ok: bufferPct != null && Math.abs(bufferPct) >= minBufPct,
+      ref: bufRefStr,
+      ok: bufOk,
     },
     {
       k: "adverse_momentum",
@@ -295,6 +363,7 @@ function buildGates(
       ok: volGate == null || (realVol != null && realVol <= volGate),
     },
   ];
+  return { cell: cellState, gates };
 }
 
 type BookLevel = { p: number; sz: number };
@@ -673,7 +742,11 @@ export default function DashboardPage({
   const mm = String(Math.floor(secondsRemaining / 60)).padStart(2, "0");
   const ss = String(secondsRemaining % 60).padStart(2, "0");
 
-  const gates = market ? buildGates(activeKey, data, secondsRemaining) : [];
+  const gatePanel = market
+    ? buildGates(activeKey, data, secondsRemaining)
+    : { cell: { name: cellNameFor(activeKey), enabled: false, reason: null, missing: true }, gates: [] };
+  const gates = gatePanel.gates;
+  const cellState = gatePanel.cell;
   const failedGates = gates.filter((g) => !g.ok).length;
   const book = market ? buildBook(market) : null;
   const maxBookSize = book
@@ -816,7 +889,14 @@ export default function DashboardPage({
               {availableKeys.map((k) => {
                 const m = data.markets[k]!;
                 const info = splitAssetKey(k);
-                const fails = buildGates(k, data).filter((g) => !g.ok).length;
+                const panel = buildGates(k, data);
+                const fails = panel.gates.filter((g) => !g.ok).length;
+                // Cell-off supersedes per-gate failures — when the cell
+                // is disabled, no trade can fire regardless of gate
+                // state, so show CELL OFF and keep the tab greyed out.
+                const cellOff = !panel.cell.enabled;
+                const flagText = cellOff ? "CELL OFF" : fails ? `${fails} BLOCK` : "PASS";
+                const flagClass = cellOff ? "r-dim" : fails ? "r-neg" : "r-pos";
                 return (
                   <div
                     key={k}
@@ -831,8 +911,8 @@ export default function DashboardPage({
                       </span>
                     </span>
                     <span className="r-mkt-tab-id">{tickerWindowLabel(m.ticker)}</span>
-                    <span className={`r-mkt-tab-flag ${fails ? "r-neg" : "r-pos"}`}>
-                      {fails ? `${fails} BLOCK` : "PASS"}
+                    <span className={`r-mkt-tab-flag ${flagClass}`}>
+                      {flagText}
                     </span>
                   </div>
                 );
@@ -874,15 +954,40 @@ export default function DashboardPage({
             <div
               style={{
                 marginTop: 18,
-                color: failedGates ? "var(--r-neg)" : "var(--r-pos)",
+                color: !cellState.enabled
+                  ? "var(--r-ink-3)"
+                  : failedGates ? "var(--r-neg)" : "var(--r-pos)",
                 letterSpacing: "0.18em",
               }}
             >
-              {gates.length === 0 ? "—" : failedGates ? `${failedGates} BLOCK` : "ALL PASS"}
+              {!cellState.enabled
+                ? "CELL OFF"
+                : gates.length === 0
+                  ? "—"
+                  : failedGates ? `${failedGates} BLOCK` : "ALL PASS"}
             </div>
           </div>
           <div className="r-gates">
-            {gates.length === 0 && (
+            {/* Cell-off banner: the scanner's first check is "is this
+                cell in the safe list?" (bot.py:1484 no_cell bump). If
+                the cell is off no trade can fire, regardless of what
+                the per-trade rows below say. Show this prominently so
+                the user isn't misled by green gates under a dead cell. */}
+            {!cellState.enabled && (
+              <div className="r-gate" style={{ background: "var(--r-bg-2)" }}>
+                <span className="r-gate-name" style={{ color: "var(--r-neg)" }}>
+                  cell · {cellState.name}
+                </span>
+                <span className="r-gate-val" style={{ color: "var(--r-ink-3)" }}>
+                  {cellState.missing ? "not in rr_params.json" : "failed CV safety gate"}
+                </span>
+                <span className="r-gate-ref" style={{ color: "var(--r-ink-3)", whiteSpace: "normal" }}>
+                  {cellState.reason ?? "—"}
+                </span>
+                <span className="r-gate-flag r-no">OFF</span>
+              </div>
+            )}
+            {gates.length === 0 && cellState.enabled && (
               <div className="r-gate">
                 <span className="r-gate-name" style={{ color: "var(--r-ink-3)" }}>
                   no gates available for selected market
@@ -890,7 +995,11 @@ export default function DashboardPage({
               </div>
             )}
             {gates.map((g) => (
-              <div className="r-gate" key={g.k}>
+              <div
+                className="r-gate"
+                key={g.k}
+                style={!cellState.enabled ? { opacity: 0.4 } : undefined}
+              >
                 <span className="r-gate-name">{g.k}</span>
                 <span className="r-gate-val">{g.v}</span>
                 <span className="r-gate-ref">{g.ref}</span>

@@ -9,6 +9,7 @@ import base64
 import datetime
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -29,13 +30,88 @@ DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
 PROD_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 
+class _TokenBucket:
+    """Thread-safe token-bucket rate limiter with adaptive backoff.
+
+    acquire() blocks until one token is available; up to `burst` tokens
+    can be consumed at once, then refills at `rate` tokens/sec. penalize(s)
+    drains the bucket so every subsequent acquire() waits at least `s`
+    seconds — this is how a 429 is propagated to every concurrent caller,
+    not just the one that got throttled.
+    """
+
+    __slots__ = ("_rate", "_burst", "_tokens", "_last", "_lock", "_waits")
+
+    def __init__(self, rate: float, burst: float):
+        self._rate = rate
+        self._burst = burst
+        self._tokens = burst
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+        self._waits = 0
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(
+                    self._burst,
+                    self._tokens + (now - self._last) * self._rate,
+                )
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self._rate
+                self._waits += 1
+            time.sleep(wait)
+
+    def penalize(self, seconds: float) -> None:
+        """Drain the bucket so next acquire() waits at least `seconds`."""
+        if seconds <= 0:
+            return
+        with self._lock:
+            floor = 1.0 - seconds * self._rate
+            self._tokens = min(self._tokens, floor)
+            self._last = time.monotonic()
+
+    def drain_waits(self) -> int:
+        """Return the number of blocking waits since last call, reset counter."""
+        with self._lock:
+            w = self._waits
+            self._waits = 0
+            return w
+
+
+def _parse_retry_after(value, attempt: int) -> float:
+    """Parse the server's Retry-After header, falling back to bounded
+    exponential backoff if the value is missing or malformed."""
+    fallback = float(min(1 << max(0, attempt), 30))
+    if value is None:
+        return fallback
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return fallback
+
+
 class KalshiClient:
     """Authenticated client for the Kalshi Trading API v2."""
 
-    # Rate limiter shared across all instances (Kalshi rate-limits per API key)
-    _rate_lock = threading.Lock()
-    _request_times: list[float] = []
-    _max_requests_per_second = 8  # Stay under Kalshi's limit with headroom for orders
+    # Kalshi's documented per-key caps are 20 reads/sec and 10 writes/sec.
+    # We run at 75% of each to leave headroom for bursts from scanner
+    # refresh cycles. Env-tunable — lower if you see recurring 429s.
+    _READ_RATE = float(os.environ.get("KALSHI_READ_RATE", "15"))
+    _WRITE_RATE = float(os.environ.get("KALSHI_WRITE_RATE", "8"))
+
+    # Shared across all instances (Kalshi limits are per API key).
+    _read_bucket = _TokenBucket(_READ_RATE, _READ_RATE)
+    _write_bucket = _TokenBucket(_WRITE_RATE, _WRITE_RATE)
+
+    # Per-minute call stats for the [KALSHI-API] summary line.
+    _stats_lock = threading.Lock()
+    _stats = {"reads": 0, "writes": 0, "r429": 0, "w429": 0,
+              "last_report": time.monotonic()}
 
     def __init__(self, key_id: str, private_key_path: str, env: str = "demo"):
         self.key_id = key_id
@@ -54,21 +130,38 @@ class KalshiClient:
                 f.read(), password=None, backend=default_backend()
             )
 
-    def _wait_for_rate_limit(self):
-        """Block until we're under the per-second request cap."""
-        with self._rate_lock:
+    def _record_call(self, is_read: bool, is_429: bool = False) -> None:
+        """Bump per-minute call counters; emit a summary line every 60s.
+
+        One summary per minute across all instances so the journal
+        shows true aggregate throughput vs Kalshi's per-key limit.
+        """
+        cls = type(self)
+        with cls._stats_lock:
+            s = cls._stats
+            if is_429:
+                s["r429" if is_read else "w429"] += 1
+            elif is_read:
+                s["reads"] += 1
+            else:
+                s["writes"] += 1
             now = time.monotonic()
-            # Prune timestamps older than 1 second
-            self._request_times = [t for t in self._request_times if now - t < 1.0]
-            if len(self._request_times) >= self._max_requests_per_second:
-                sleep_until = self._request_times[0] + 1.0
-                wait = sleep_until - now
-                if wait > 0:
-                    time.sleep(wait)
-                # Prune again after sleeping
-                now = time.monotonic()
-                self._request_times = [t for t in self._request_times if now - t < 1.0]
-            self._request_times.append(time.monotonic())
+            if now - s["last_report"] < 60.0:
+                return
+            elapsed = now - s["last_report"]
+            r_per_s = s["reads"] / elapsed
+            w_per_s = s["writes"] / elapsed
+            r429, w429 = s["r429"], s["w429"]
+            s["reads"] = s["writes"] = s["r429"] = s["w429"] = 0
+            s["last_report"] = now
+        rw = cls._read_bucket.drain_waits()
+        ww = cls._write_bucket.drain_waits()
+        print(
+            f"[KALSHI-API] last 60s: "
+            f"reads={r_per_s:.1f}/s ({r429} × 429, {rw} waits), "
+            f"writes={w_per_s:.1f}/s ({w429} × 429, {ww} waits)",
+            flush=True,
+        )
 
     def _sign(self, timestamp_ms: str, method: str, path: str) -> str:
         """Create RSA-PSS signature for request authentication."""
@@ -95,77 +188,100 @@ class KalshiClient:
             "KALSHI-ACCESS-TIMESTAMP": timestamp,
         }
 
-    def _request(self, method: str, path: str, params: dict = None, data: dict = None):
-        """Make an authenticated request to the Kalshi API with retry/backoff."""
+    _MAX_ATTEMPTS = 3
+    _TRANSIENT_BACKOFF_CAP = 4.0  # seconds, for network/5xx retries
+
+    def _do_http(self, method: str, path: str, *,
+                 params: dict = None, data: dict = None,
+                 authenticate: bool) -> dict:
+        """Execute an HTTP call with token-bucket rate limit and bounded retry.
+
+        Reads (GET) and writes (POST/DELETE/PUT) consume from separate
+        buckets so a read burst cannot starve writes (or vice versa) —
+        Kalshi's per-key limits are 20 reads/sec and 10 writes/sec. A
+        429 drains the matching bucket by Retry-After seconds, which
+        naturally paces every concurrent caller's next acquire(); we do
+        not sleep in the caller thread on 429 because the next retry's
+        bucket.acquire() will wait precisely as long as needed.
+
+        Non-429 4xx responses are treated as client errors and raise
+        immediately. 5xx and network errors get bounded exponential
+        backoff, capped at _TRANSIENT_BACKOFF_CAP seconds.
+        """
         from urllib.parse import urlparse
 
-        last_exc = None
-        for attempt in range(3):
-            self._wait_for_rate_limit()
-            try:
-                url = f"{self.base_url}{path}"
-                sign_path = urlparse(url).path
-                # Re-sign on each attempt (timestamp must be fresh)
-                headers = self._auth_headers(method.upper(), sign_path)
+        method_u = method.upper()
+        is_read = method_u == "GET"
+        bucket = type(self)._read_bucket if is_read else type(self)._write_bucket
+        url = f"{self.base_url}{path}"
 
-                resp = self.session.request(
-                    method=method.upper(),
-                    url=url,
-                    headers=headers,
-                    params=params,
-                    json=data,
-                    timeout=10,
-                )
-                # Don't retry client errors (4xx) except 429
+        last_exc: Optional[Exception] = None
+        for attempt in range(self._MAX_ATTEMPTS):
+            bucket.acquire()
+            try:
+                kwargs: dict = {"params": params, "json": data, "timeout": 10}
+                if authenticate:
+                    sign_path = urlparse(url).path
+                    # Re-sign each attempt — timestamp must be fresh.
+                    kwargs["headers"] = self._auth_headers(method_u, sign_path)
+
+                resp = self.session.request(method_u, url, **kwargs)
+
                 if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", 2 ** attempt))
-                    logger.warning(f"Rate limited (429), retrying in {retry_after}s")
-                    time.sleep(retry_after)
-                    continue
+                    retry_after = _parse_retry_after(
+                        resp.headers.get("Retry-After"), attempt)
+                    bucket.penalize(retry_after)
+                    self._record_call(is_read, is_429=True)
+                    last_exc = HTTPError(
+                        f"429 Too Many Requests on {method_u} {path}",
+                        response=resp)
+                    if attempt + 1 < self._MAX_ATTEMPTS:
+                        logger.warning(
+                            f"Rate limited (429) on {method_u} {path}; "
+                            f"bucket backing off {retry_after:.1f}s")
+                        continue
+                    break  # give up after max attempts
+
                 resp.raise_for_status()
+                self._record_call(is_read)
                 return resp.json()
+
             except (ConnectionError, Timeout, ChunkedEncodingError) as e:
                 last_exc = e
-                wait = 2 ** attempt
-                logger.warning(f"Request failed (attempt {attempt + 1}/3): {e}, retrying in {wait}s")
+                if attempt + 1 >= self._MAX_ATTEMPTS:
+                    break
+                wait = min(float(1 << attempt), self._TRANSIENT_BACKOFF_CAP)
+                logger.warning(
+                    f"Request failed (attempt {attempt + 1}/{self._MAX_ATTEMPTS}) "
+                    f"on {method_u} {path}: {e}; retrying in {wait:.1f}s")
                 time.sleep(wait)
-            except HTTPError as e:
-                if e.response is not None and e.response.status_code < 500:
-                    raise  # Don't retry client errors
-                last_exc = e
-                wait = 2 ** attempt
-                logger.warning(f"Server error (attempt {attempt + 1}/3): {e}, retrying in {wait}s")
-                time.sleep(wait)
-        raise last_exc
 
-    def _public_get(self, path: str, params: dict = None):
-        """Make an unauthenticated GET (public market data) with retry/backoff."""
-        last_exc = None
-        for attempt in range(3):
-            self._wait_for_rate_limit()
-            try:
-                url = f"{self.base_url}{path}"
-                resp = self.session.get(url, params=params, timeout=10)
-                if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", 2 ** attempt))
-                    logger.warning(f"Rate limited (429), retrying in {retry_after}s")
-                    time.sleep(retry_after)
-                    continue
-                resp.raise_for_status()
-                return resp.json()
-            except (ConnectionError, Timeout, ChunkedEncodingError) as e:
-                last_exc = e
-                wait = 2 ** attempt
-                logger.warning(f"Public GET failed (attempt {attempt + 1}/3): {e}, retrying in {wait}s")
-                time.sleep(wait)
             except HTTPError as e:
-                if e.response is not None and e.response.status_code < 500:
+                status = (e.response.status_code
+                          if e.response is not None else 500)
+                # 4xx (except 429, handled above) is a client error — don't retry.
+                if 400 <= status < 500:
                     raise
                 last_exc = e
-                wait = 2 ** attempt
-                logger.warning(f"Server error (attempt {attempt + 1}/3): {e}, retrying in {wait}s")
+                if attempt + 1 >= self._MAX_ATTEMPTS:
+                    break
+                wait = min(float(1 << attempt), self._TRANSIENT_BACKOFF_CAP)
+                logger.warning(
+                    f"Server error (attempt {attempt + 1}/{self._MAX_ATTEMPTS}) "
+                    f"on {method_u} {path}: {e}; retrying in {wait:.1f}s")
                 time.sleep(wait)
-        raise last_exc
+
+        raise last_exc if last_exc else RuntimeError(
+            f"Request to {method_u} {path} failed without an exception")
+
+    def _request(self, method: str, path: str, params: dict = None, data: dict = None):
+        """Authenticated request to the Kalshi API."""
+        return self._do_http(method, path, params=params, data=data,
+                             authenticate=True)
+
+    def _public_get(self, path: str, params: dict = None):
+        """Unauthenticated GET for public market data."""
+        return self._do_http("GET", path, params=params, authenticate=False)
 
     # ─── Market Data (Public) ────────────────────────────────────────────
 

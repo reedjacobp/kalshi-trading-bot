@@ -106,6 +106,160 @@ def parse_book_top(book: dict) -> tuple:
 _STRIKE_TITLE_RE = re.compile(r'\$([0-9,]+\.?\d*)')
 
 
+# Per-cell optimizer output from rr_params.json is the source of truth
+# for gate values. The previous HEURISTIC_PARAMS overlay was removed on
+# 2026-04-22 after analysis showed it was uniformly loosening safety on
+# the bot's best cells (btc_15m, btc_hourly, eth_15m — trained buffers
+# 0.46-0.68% forced down to 0.15%) while tightening the noisy ones — a
+# bad tradeoff when cells that pass the optimizer's CV gate already
+# encode per-cell-specific safety in their trained thresholds.
+#
+# Defense in depth is still in place at the strategy level
+# (resolution_rider.py): max_entry_price clamped ≤ 97c (98c trap) and
+# min_price_buffer_pct floored at 0.15% (the specific incident that
+# triggered the overlay). Those are surgical — they bite only on the
+# two known failure modes, not across every dimension of every cell.
+
+
+def _classify_ticker_cell(ticker: str) -> Optional[str]:
+    """Map a Kalshi ticker to its cell name (e.g. 'btc_15m', 'eth_hourly').
+    Returns None for non-crypto or unrecognized tickers. Mirrors
+    optimize_rr.classify_ticker but kept inline to avoid the optimizer
+    import pulling in numpy/pandas at bot startup.
+    """
+    if not ticker:
+        return None
+    series = ticker.upper().split("-", 1)[0]
+    if series == "KXSHIBAD":
+        return "shiba_daily"
+    for coin in ("BTC", "ETH", "SOL", "DOGE", "XRP", "BNB", "HYPE"):
+        if series == f"KX{coin}15M":
+            return f"{coin.lower()}_15m"
+        if series == f"KX{coin}D":
+            return f"{coin.lower()}_hourly"
+    return None
+
+
+def load_recent_cell_pnl(days: int = 7,
+                         csv_path: Optional[Path] = None) -> dict[str, dict]:
+    """Compute per-cell settled P&L from live_trades.csv over the last N days.
+
+    Returns {cell_name: {"n_trades": int, "profit_usd": float, "wins": int,
+                          "worst_loss_usd": float}}.
+    `worst_loss_usd` is the absolute value of the largest single losing
+    trade in the window (0.0 if no losses). Cancels and pending orders
+    contribute nothing. Only resolution_rider strategy rows are counted.
+
+    This is the ground-truth reality check used by evaluate_cell_safety —
+    no CV, no simulator, just what we actually made.
+    """
+    path = csv_path or Path("data/live_trades.csv")
+    if not path.exists():
+        return {}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    result: dict[str, dict] = {}
+    try:
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                if (row.get("strategy") or "") != "resolution_rider":
+                    continue
+                outcome = (row.get("outcome") or "").strip()
+                if outcome not in ("win", "loss"):
+                    continue
+                t_str = (row.get("time") or "").replace("Z", "+00:00")
+                try:
+                    t = datetime.fromisoformat(t_str)
+                except ValueError:
+                    continue
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=timezone.utc)
+                if t < cutoff:
+                    continue
+                cell = _classify_ticker_cell(row.get("ticker", ""))
+                if not cell:
+                    continue
+                slot = result.setdefault(
+                    cell, {"n_trades": 0, "profit_usd": 0.0,
+                           "wins": 0, "worst_loss_usd": 0.0})
+                slot["n_trades"] += 1
+                if outcome == "win":
+                    slot["wins"] += 1
+                try:
+                    p = float(row.get("profit_usd") or 0)
+                except ValueError:
+                    p = 0.0
+                slot["profit_usd"] += p
+                if outcome == "loss" and p < 0:
+                    loss_abs = -p
+                    if loss_abs > slot["worst_loss_usd"]:
+                        slot["worst_loss_usd"] = loss_abs
+    except OSError:
+        return {}
+    return result
+
+
+# Minimum settled trades required in the 7d window before we'll disable
+# a cell on the basis of cumulative P&L. Under this, there's not enough
+# evidence to veto on the cumulative rule — let the cell gather data.
+# The loss-count veto (MAX_7D_LOSSES_VETO) still applies at any n.
+MIN_CELL_VETO_TRADES = int(os.environ.get("MIN_CELL_VETO_TRADES", "5"))
+
+# Loss-count veto: if a cell logs ≥ this many settled losses in the
+# rolling 7-day window, disable it regardless of cumulative P&L or
+# trade count. Previously this was a dollar-amount threshold
+# (MAX_SINGLE_LOSS_VETO_USD=$50), but that fired on every ordinary 97c
+# loss at $100 stakes — disabling profitable cells on a single bad
+# fill. Counts are stake-insensitive: 3+ losses in 7d is a signal
+# regardless of whether stakes were $10 or $500.
+#
+# Default 3: at 95% WR a cell should see ≤2 losses/7d on realistic
+# volume; 3+ is outside the noise distribution. Env-tunable.
+MAX_7D_LOSSES_VETO = int(os.environ.get("MAX_7D_LOSSES_VETO", "3"))
+
+
+def evaluate_cell_safety(cell_name: str, v: dict,
+                         pnl_by_cell: Optional[dict] = None,
+                         enable_all: bool = False,
+                         safety_margin: float = 0.0) -> tuple[bool, str]:
+    """Decide whether a cell should be allowed to trade, from live P&L.
+
+    Returns (enabled, reason). reason is a short human string when
+    disabled, or "" when enabled.
+
+    Rules, in order:
+      1. RR_ENABLE_ALL=1 → always enable (validation mode).
+      2. ≥ MAX_7D_LOSSES_VETO settled losses in the 7d window → DISABLE
+         (pattern-of-losses veto; applies at any trade count).
+      3. Fewer than MIN_CELL_VETO_TRADES settled trades in the last 7
+         days → enable (insufficient evidence for cumulative veto).
+      4. Non-negative 7-day cumulative P&L → enable.
+      5. Otherwise → disable with the numbers in the reason string.
+
+    `v` and `safety_margin` are accepted for backward compatibility
+    with callers that still pass them; the new gate ignores them.
+    """
+    if enable_all:
+        return True, ""
+    stats = (pnl_by_cell or {}).get(
+        cell_name,
+        {"n_trades": 0, "profit_usd": 0.0, "wins": 0, "worst_loss_usd": 0.0})
+    n = stats["n_trades"]
+    w = stats.get("wins", 0)
+    n_losses = max(0, n - w)
+    if n_losses >= MAX_7D_LOSSES_VETO:
+        return False, (
+            f"loss-count veto: {n_losses} losses in 7d "
+            f"(≥ {MAX_7D_LOSSES_VETO} threshold; {n} trades, "
+            f"worst ${stats.get('worst_loss_usd', 0.0):.2f})")
+    p = stats["profit_usd"]
+    if n < MIN_CELL_VETO_TRADES:
+        return True, ""
+    if p >= 0:
+        return True, ""
+    return False, (f"7d live P&L ${p:+.2f} over {n} trades "
+                   f"({w}W/{n_losses}L); needs ≥$0")
+
+
 def best_strike_for_market(market: dict):
     """Return the best-available strike (float) for a Kalshi market, or None.
 
@@ -212,6 +366,10 @@ class TradeLogger:
         self.csv_path = Path(csv_path)
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id
+        # Single lock for all CSV mutations. upsert_entry does a
+        # read-modify-write cycle, so concurrent writers without this
+        # would silently lose rows.
+        self._lock = threading.Lock()
         self._migrate_csv()
         self._init_csv()
 
@@ -289,8 +447,9 @@ class TradeLogger:
         ]
 
     def log_trade(self, record: TradeRecord, reason: str = "", confidence: float = None):
-        with open(self.csv_path, "a", newline="") as f:
-            csv.writer(f).writerow(self._row_for(record, reason, confidence))
+        with self._lock:
+            with open(self.csv_path, "a", newline="") as f:
+                csv.writer(f).writerow(self._row_for(record, reason, confidence))
 
     def upsert_entry(self, record: TradeRecord, reason: str = "", confidence: float = None):
         """Write or update a NON-settlement row for `record.order_id`.
@@ -304,40 +463,48 @@ class TradeLogger:
         """
         if not record.order_id:
             return self.log_trade(record, reason=reason, confidence=confidence)
-        new_row = self._row_for(record, reason, confidence)
-        if not self.csv_path.exists():
-            return self.log_trade(record, reason=reason, confidence=confidence)
-        with open(self.csv_path, "r", newline="") as f:
-            reader = csv.reader(f)
-            rows = list(reader)
-        if not rows:
-            return self.log_trade(record, reason=reason, confidence=confidence)
-        header = rows[0]
-        try:
-            oid_idx = header.index("order_id")
-            reason_idx = header.index("reason")
-        except ValueError:
-            return self.log_trade(record, reason=reason, confidence=confidence)
-        # Match the LAST non-settlement row with this oid so partial-fill
-        # updates land on the entry row rather than overwriting a settlement.
-        target = None
-        for i in range(len(rows) - 1, 0, -1):
-            r = rows[i]
-            if len(r) <= oid_idx:
-                continue
-            if r[oid_idx] != record.order_id:
-                continue
-            if r[reason_idx].startswith("SETTLED:"):
-                continue
-            target = i
-            break
-        if target is None:
-            self.log_trade(record, reason=reason, confidence=confidence)
-            return
-        rows[target] = new_row
-        with open(self.csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerows(rows)
+        with self._lock:
+            new_row = self._row_for(record, reason, confidence)
+            if not self.csv_path.exists():
+                with open(self.csv_path, "a", newline="") as f:
+                    csv.writer(f).writerow(new_row)
+                return
+            with open(self.csv_path, "r", newline="") as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+            if not rows:
+                with open(self.csv_path, "a", newline="") as f:
+                    csv.writer(f).writerow(new_row)
+                return
+            header = rows[0]
+            try:
+                oid_idx = header.index("order_id")
+                reason_idx = header.index("reason")
+            except ValueError:
+                with open(self.csv_path, "a", newline="") as f:
+                    csv.writer(f).writerow(new_row)
+                return
+            # Match the LAST non-settlement row with this oid so partial-fill
+            # updates land on the entry row rather than overwriting a settlement.
+            target = None
+            for i in range(len(rows) - 1, 0, -1):
+                r = rows[i]
+                if len(r) <= oid_idx:
+                    continue
+                if r[oid_idx] != record.order_id:
+                    continue
+                if r[reason_idx].startswith("SETTLED:"):
+                    continue
+                target = i
+                break
+            if target is None:
+                with open(self.csv_path, "a", newline="") as f:
+                    csv.writer(f).writerow(new_row)
+                return
+            rows[target] = new_row
+            with open(self.csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerows(rows)
 
     def log_settlement(self, record: TradeRecord):
         """Update the CSV with settlement info (appends a settlement row)."""
@@ -1078,50 +1245,59 @@ class TradingBot:
         # Each cell (e.g. "xrp_15m") has its own max_seconds, buffer, momentum
         # gate, etc. Only cells that are cross-validation-profitable are kept.
         self._rr_cell_params = {}
+        # Full cell set (enabled + disabled) with the gate verdict annotated
+        # on each — published to the dashboard so users can see *why* a
+        # cell is off. self._rr_cell_params stays safe-only for the
+        # scanner's fast path.
+        self._rr_cell_params_all = {}
         rr_params_path = Path("data/rr_params.json")
         if rr_params_path.exists():
             with open(rr_params_path) as f:
                 all_rr_params = json.load(f)
-            # Cell safety gate. Set RR_ENABLE_ALL=1 to bypass and let
-            # every cell with CV data trade (best-case / validation mode).
+            # Cell enable/disable gate. Set RR_ENABLE_ALL=1 to bypass
+            # and let every known cell trade (validation mode).
             enable_all = os.environ.get("RR_ENABLE_ALL", "0") == "1"
 
-            def _cell_is_safe(v: dict) -> bool:
-                if enable_all:
-                    # Only require minimum data: some CV or positive training
-                    return (v.get("cv_total_val_trades", 0) >= 10
-                            or v.get("training_trades", 0) >= 5)
-                if v.get("cv_folds", 0) == 0:
-                    return v.get("training_profit", 0) > 0
-                wr_lb = v.get("cv_wr_lower_bound", 0)
-                trades = v.get("cv_total_val_trades", 0)
-                profit = v.get("cv_val_profit", -999)
-                if trades < 30:
-                    return False
-                # High WR confidence — near-certain at typical entry prices
-                if wr_lb >= 0.93:
-                    return True
-                # Positive CV profit with reasonable WR — the optimizer
-                # found this cell actually makes money
-                if profit > 0 and wr_lb >= 0.80:
-                    return True
-                # Breakeven-aware gate: WR_LB must exceed the breakeven
-                # WR for this cell's entry price. At 95c, breakeven is
-                # 95%; at 90c, breakeven is 90%. A cell with 88% WR_LB
-                # at 88c min entry is viable, but not at 95c.
-                min_cp = v.get("min_contract_price", 95)
-                breakeven_wr = min_cp / 100.0
-                if wr_lb >= breakeven_wr and trades >= 50:
-                    return True
-                return False
+            # Load live P&L over the last 7 days. This is the sole
+            # signal used by evaluate_cell_safety — a cell with
+            # non-negative 7d P&L (or too few trades to veto) is
+            # enabled; a cell losing money over 7 days is disabled.
+            pnl_by_cell = load_recent_cell_pnl(days=7)
+            if pnl_by_cell:
+                self._log(
+                    f"[INIT] 7d live P&L loaded: "
+                    + ", ".join(
+                        f"{c}=${s['profit_usd']:+.2f}({s['n_trades']}t)"
+                        for c, s in sorted(pnl_by_cell.items())
+                    )
+                )
 
-            safe_cells = {k: v for k, v in all_rr_params.items() if _cell_is_safe(v)}
+            safe_cells = {}
+            annotated = {}
+            for k, v in all_rr_params.items():
+                ok, reason = evaluate_cell_safety(
+                    k, v, pnl_by_cell=pnl_by_cell, enable_all=enable_all)
+                # Pass per-cell optimizer params through directly. The
+                # strategy-level clamps (max_ep ≤ 97, min_buf ≥ 0.15)
+                # still apply at evaluate() time — those are the only
+                # hard safety invariants.
+                merged = dict(v)
+                annotated[k] = {**merged, "enabled": ok,
+                                "disabled_reason": reason or None}
+                if ok:
+                    safe_cells[k] = merged
             self._rr_cell_params = safe_cells
-            self._log(f"[INIT] Loaded optimized RR params: {len(safe_cells)} safe cells "
+            self._rr_cell_params_all = annotated
+            self._log(f"[INIT] RR cells enabled: {len(safe_cells)} "
                       f"({', '.join(sorted(safe_cells.keys()))})")
             unsafe = set(all_rr_params.keys()) - set(safe_cells.keys())
             if unsafe:
-                self._log(f"[INIT] Disabled RR cells (CV losses): {', '.join(sorted(unsafe))}")
+                reasons = [
+                    f"{c}: {annotated[c]['disabled_reason']}"
+                    for c in sorted(unsafe)
+                ]
+                self._log(f"[INIT] Disabled RR cells:\n    "
+                          + "\n    ".join(reasons))
 
         # Enable safe RR cells, disable unsafe ones
         for asset in active_assets:
@@ -1160,6 +1336,11 @@ class TradingBot:
                     "secs_left", "cell",
                 ])
         self._hit_ctx: Optional[dict] = None
+        # Lock for the hit_outcomes.csv write path. Separate from the
+        # TradeLogger lock because they write different files; making
+        # them independent reduces contention when a parallel submission
+        # fan-out writes both in flight.
+        self._hit_outcomes_lock = threading.Lock()
         # Rolling 24h outcome counts for dashboard summary.
         self._hit_outcome_counts: dict = {}
         self._hit_outcome_window_start: float = time.time()
@@ -1194,20 +1375,45 @@ class TradingBot:
         print(msg)
         getattr(self.file_log, level, self.file_log.info)(msg)
 
+    # Balance cache: _get_balance is called from _maybe_trade (per trade)
+    # AND _publish_tick (4× per second for SSE). Without caching that was
+    # ~4 REST calls/sec doing nothing useful. Cache for 10s — balance only
+    # changes when we trade or a position settles, and both paths are
+    # already handled by invalidate_balance_cache() below, so 10s of
+    # staleness on rare unsynced balance moves is acceptable.
+    _BALANCE_CACHE_TTL_S = 10.0
+
+    def invalidate_balance_cache(self) -> None:
+        """Call after submitting an order or recording a settlement so the
+        next _get_balance() fetches fresh rather than serving a stale value.
+        Safe to call from any thread — pure attribute write."""
+        self._balance_cache_ts = 0.0
+
     def _get_balance(self) -> float:
-        """Fetch account balance. Returns USD available, or fallback for paper mode."""
+        """Fetch account balance with a short TTL cache. Returns USD
+        available. In paper mode, returns a simulated balance (no caching
+        since it's already a cheap local computation)."""
         if self.config["paper_trade"]:
-            # Paper mode: simulate a starting balance minus open stakes
             paper_balance = float(os.getenv("PAPER_BALANCE", "100.00"))
             open_stake = sum(t.stake_usd for t in self.risk_mgr.trades if t.outcome == "")
             return max(0, paper_balance + self.risk_mgr.total_pnl - open_stake)
+
+        now = time.time()
+        cache_ts = getattr(self, '_balance_cache_ts', 0.0)
+        if now - cache_ts < self._BALANCE_CACHE_TTL_S:
+            return getattr(self, '_balance_cache_value', 0.0)
+
         try:
             resp = self.client.get_balance()
-            # Kalshi returns balance in cents
-            return resp.get("balance", 0) / 100.0
+            value = resp.get("balance", 0) / 100.0  # Kalshi returns cents
+            self._balance_cache_value = value
+            self._balance_cache_ts = now
+            return value
         except Exception as e:
             self._log(f"  [WARN] Failed to fetch balance: {e}", level="warning")
-            return 0.0
+            # Return cached value if we have one — better than 0 which
+            # would falsely trip the balance gate.
+            return getattr(self, '_balance_cache_value', 0.0)
 
     def _init_strategies(self, strategy_name: str) -> dict:
         """Initialize the trading strategies. Only Resolution Rider remains;
@@ -1321,6 +1527,11 @@ class TradingBot:
         # future optimizer features (book imbalance, depth-at-level, etc).
         self._start_orderbook_thread()
 
+        # Start missed-trades watchdog — periodically flags settled
+        # markets that reached 94c+ on the winning side without us
+        # trading them.
+        self._start_missed_trades_thread()
+
         print(f"{'='*72}")
         print("Warming up price feed (collecting 60s of data)...")
 
@@ -1376,9 +1587,17 @@ class TradingBot:
             self._shutdown()
 
     def _refresh_rr_cache(self):
-        """Refresh the cached active market per asset (called from slow path)."""
+        """Refresh the cached active market per asset (called from slow path).
+
+        Interval: 2s on 2026-04-21 (was 5s). The underlying scanner
+        REST cache is also 3s for "open" status, so 2s polling means
+        we hit the fresh edge of that cache. Combined with paginated
+        `_fresh_markets` (no more 200-market truncation) this closes
+        the "missed trades due to discovery latency" gap the 4/21
+        analysis identified.
+        """
         now = time.time()
-        if now - getattr(self, '_last_rr_cache_refresh', 0) < 10:
+        if now - getattr(self, '_last_rr_cache_refresh', 0) < 2:
             return
         self._last_rr_cache_refresh = now
         for key, asset in self.assets.items():
@@ -1406,7 +1625,15 @@ class TradingBot:
                     # strike (which turned out to be ~70% of btc_hourly
                     # cached strikes — the "no_ws_tick" debug counter).
                     if asset.get("is_daily"):
-                        rr_markets = scanner.get_near_certain_markets(max_hours=1.0)
+                        # 1.0 → 3.0 on 2026-04-21. Analysis of missed
+                        # winners on 4/21 showed many daily strikes
+                        # closing 1–3 hours out were skipped by the
+                        # 1-hour filter, even though their favorite
+                        # side was already at 94c+ with massive buffers.
+                        # 3 hours captures those while still excluding
+                        # far-out strikes where price can still move
+                        # meaningfully before close.
+                        rr_markets = scanner.get_near_certain_markets(max_hours=3.0)
                         cached = []
                         for m in rr_markets:
                             yb, ya = scanner.parse_yes_price(m)
@@ -1426,6 +1653,23 @@ class TradingBot:
                 if not hasattr(self, '_rr_cache_err_ts') or time.time() - self._rr_cache_err_ts > 60:
                     self._log(f"  [RR-CACHE] {key}: refresh error: {e}", level="warning")
                     self._rr_cache_err_ts = time.time()
+
+        # Market-coverage heartbeat: every 60s, log how many markets
+        # each daily asset is watching. Lets us spot coverage gaps
+        # (e.g., pagination truncated, max_hours too tight, scanner
+        # error hiding markets) without tailing debug counters. The
+        # count should be roughly stable; a sudden drop is a signal.
+        if (not hasattr(self, '_rr_coverage_log_ts')
+                or time.time() - self._rr_coverage_log_ts > 60):
+            self._rr_coverage_log_ts = time.time()
+            parts = []
+            for key, asset in self.assets.items():
+                if not asset.get("is_daily"):
+                    continue
+                ml = asset.get("_rr_daily_markets") or []
+                parts.append(f"{key}={len(ml)}")
+            if parts:
+                self._log(f"  [RR-COVERAGE] daily strikes watched: {', '.join(parts)}")
 
     def _fast_rr_scan(self):
         """
@@ -1469,6 +1713,12 @@ class TradingBot:
                     "detail": detail or {},
                     "last_seen": time.time(),
                 }
+
+        # Candidates that pass every gate in this sweep. Dispatched after
+        # the gate loop so bursts of simultaneous 94c+ setups are handled
+        # in parallel (bounded thread pool) rather than serialized through
+        # network latency.
+        pending_trades: list = []
 
         for key, asset in self.assets.items():
             cache = asset.get("_rr_market")
@@ -1535,16 +1785,34 @@ class TradingBot:
                 # bid/ask from _refresh_rr_cache. Fallback is important for
                 # daily strikes that aren't actively quoted on WS but do
                 # have REST-cached prices (scanner's own lookup).
+                #
+                # CRITICAL: ws_feed.get_tick() returns the last-stored tick
+                # with no freshness check. A quiet market (no WS update
+                # for minutes) will still return its stale tick, which
+                # would then make gate decisions against a price the book
+                # has long since left. We require ts-freshness matching
+                # the REST cache cadence; stale ticks fall through to REST.
+                WS_TICK_MAX_AGE_S = 5.0
                 tick = self.ws_feed.get_tick(ticker)
-                if tick and tick.yes_bid and tick.yes_ask:
+                tick_age = time.time() - tick.ts if tick else None
+                if (tick and tick.yes_bid and tick.yes_ask
+                        and tick_age is not None and tick_age <= WS_TICK_MAX_AGE_S):
                     bid, ask = tick.yes_bid, tick.yes_ask
                 else:
                     bid = market_cache.get("yes_bid")
                     ask = market_cache.get("yes_ask")
                     if not bid or not ask:
                         bump(cell_name, "no_price", ticker=ticker,
-                             detail={"secs_left": round(secs_left, 1)})
+                             detail={"secs_left": round(secs_left, 1),
+                                     "ws_tick_age_s": (round(tick_age, 1)
+                                                       if tick_age is not None
+                                                       else None)})
                         continue
+
+                # Record which source provided bid/ask (WS or REST cache)
+                # so stale-data-driven skips are visible on the dashboard.
+                price_source = ("ws" if tick_age is not None
+                                and tick_age <= WS_TICK_MAX_AGE_S else "rest")
 
                 cell_min_cp = cell_params.get("min_contract_price", rr.min_contract_price)
                 cell_max_ep = cell_params.get("max_entry_price", rr.max_entry_price)
@@ -1554,13 +1822,21 @@ class TradingBot:
                     bump(cell_name, "fav_too_low", ticker=ticker,
                          detail={"secs_left": round(secs_left, 1),
                                  "yes_bid": bid, "yes_ask": ask,
-                                 "fav": round(fav, 1), "min_required": cell_min_cp})
+                                 "fav": round(fav, 1), "min_required": cell_min_cp,
+                                 "src": price_source,
+                                 "ws_tick_age_s": (round(tick_age, 1)
+                                                   if tick_age is not None
+                                                   else None)})
                     continue
                 if fav > cell_max_ep:
                     bump(cell_name, "fav_too_high", ticker=ticker,
                          detail={"secs_left": round(secs_left, 1),
                                  "yes_bid": bid, "yes_ask": ask,
-                                 "fav": round(fav, 1), "max_allowed": cell_max_ep})
+                                 "fav": round(fav, 1), "max_allowed": cell_max_ep,
+                                 "src": price_source,
+                                 "ws_tick_age_s": (round(tick_age, 1)
+                                                   if tick_age is not None
+                                                   else None)})
                     continue
 
                 # Price buffer check (WS-cached crypto price, zero I/O)
@@ -1660,13 +1936,10 @@ class TradingBot:
                 }
 
                 self._log(f"  [FAST-RR] Hit: {ticker} {rec.reason}")
-                # Seed the hit-outcome context. _maybe_trade will finalize
-                # it at whichever exit path fires, writing a row to
-                # hit_outcomes.csv. If _maybe_trade returns without
-                # finalizing (shouldn't happen after this change), the
-                # next Hit will overwrite and we'll notice a gap in the
-                # CSV relative to Hit log lines.
-                self._hit_ctx = {
+                # Build a per-candidate hit_ctx. Must be a local dict —
+                # parallel dispatch below would race on a shared
+                # instance attribute.
+                hit_ctx = {
                     "time": datetime.now(timezone.utc).isoformat(),
                     "ticker": ticker,
                     "strategy": "resolution_rider",
@@ -1677,20 +1950,68 @@ class TradingBot:
                 }
                 strats = {"resolution_rider": rec}
                 # Dedupe against the slow path: on daily markets the slow
-                # path checks an event_key = ticker without the strike suffix
-                # (e.g. KXSOLD-26APR1412 from KXSOLD-26APR1412-T85.9999), so
-                # adding just `ticker` leaves the slow path unaware and it
-                # fires a second order on the same market. Add both.
+                # path checks an event_key = ticker without the strike
+                # suffix (e.g. KXSOLD-26APR1412 from KXSOLD-26APR1412-
+                # T85.9999), so adding just `ticker` leaves the slow
+                # path unaware and it fires a second order on the same
+                # market. Add both. Done BEFORE dispatch so parallel
+                # workers can't double-trade a ticker already claimed.
                 self._traded_tickers.add(ticker)
                 if is_daily:
                     parts = ticker.rsplit("-", 1)
                     if len(parts) > 1:
                         self._traded_tickers.add(parts[0])
-                self._maybe_trade(market_dict, strats, asset_key=key,
-                                  cell_params=cell_params)
+                pending_trades.append((market_dict, strats, key, cell_params, hit_ctx))
+
+        # Dispatch pending submissions. Single candidate stays on the
+        # calling thread — no pool overhead. Multiple candidates fan
+        # out to a bounded pool so network latency (place_order +
+        # fill-wait) doesn't serialize across opportunities. Cap at 3
+        # workers: 3 concurrent order flows is plenty for Kalshi's
+        # write budget, and higher would start starving writes across
+        # parallel fill-wait polls.
+        if len(pending_trades) == 1:
+            m, s, k, cp, hc = pending_trades[0]
+            self._maybe_trade(m, s, asset_key=k, cell_params=cp, hit_ctx=hc)
+        elif len(pending_trades) > 1:
+            self._log(
+                f"  [FAST-RR] Dispatching {len(pending_trades)} "
+                f"parallel submissions")
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(
+                    max_workers=min(3, len(pending_trades)),
+                    thread_name_prefix="submit") as ex:
+                futures = [
+                    ex.submit(self._maybe_trade, m, s,
+                              asset_key=k, cell_params=cp, hit_ctx=hc)
+                    for m, s, k, cp, hc in pending_trades
+                ]
+                for fut in futures:
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        self._log(
+                            f"  [FAST-RR] Parallel submission raised: {e}",
+                            level="error")
 
     def _start_fast_rr_thread(self):
-        """Start the fast RR scanner in a dedicated high-frequency thread."""
+        """Start the fast RR scanner in a dedicated high-frequency thread.
+
+        The scan makes zero REST calls — pure local dict + WS cache reads
+        — so the rate limit here is practical CPU overhead, not API quota.
+        Default 50Hz (20ms between scans). Env override via RR_SCAN_HZ.
+
+        Above ~100Hz returns diminish: WS updates themselves arrive at
+        ~100ms intervals on most markets, so extra scan cycles just
+        re-evaluate the same data. Below 10Hz risks missing short-lived
+        94c+ windows that open/close in 200ms.
+        """
+        hz = float(os.environ.get("RR_SCAN_HZ", "50"))
+        # Clamp so a typo (e.g. RR_SCAN_HZ=500000) doesn't spin the CPU
+        # to 100% doing nothing useful.
+        hz = max(1.0, min(200.0, hz))
+        sleep_s = 1.0 / hz
+
         def _rr_loop():
             while self.running:
                 try:
@@ -1701,11 +2022,11 @@ class TradingBot:
                     self._rr_thread_errs += 1
                     if self._rr_thread_errs <= 3:
                         self._log(f"  [FAST-RR] Thread error: {e}", level="warning")
-                time.sleep(0.05)  # 20Hz, never blocked by REST
+                time.sleep(sleep_s)
 
         t = threading.Thread(target=_rr_loop, daemon=True, name="fast-rr")
         t.start()
-        self._log("[INIT] Fast RR thread started (20Hz, zero I/O)")
+        self._log(f"[INIT] Fast RR thread started ({hz:.0f}Hz, zero I/O)")
 
     def _start_reconcile_thread(self):
         """Periodically reconcile our CSV with Kalshi's API to keep data accurate."""
@@ -1868,6 +2189,33 @@ class TradingBot:
         t.start()
         self._log("[INIT] Orderbook snapshot thread started (~60s/market)")
 
+    def _start_missed_trades_thread(self):
+        """Start the missed-trades watchdog. Every 5 min it scans
+        recently-settled markets and flags any ticker that reached
+        94c+ on the eventually-winning side without an RR entry.
+
+        This is pure diagnostics — the tracker writes to
+        data/missed_trades.csv and publishes a recent-misses list
+        for the dashboard. It never touches the trading path.
+        """
+        import data_paths
+        from missed_trades import MissedTradeTracker
+
+        ticks_dir = data_paths.resolve("ticks")
+        output_csv = Path("data/missed_trades.csv")
+        scanners = {a["scanner"].series: a["scanner"]
+                    for a in self.assets.values()}
+        self.missed_tracker = MissedTradeTracker(
+            scanners=scanners,
+            trades_csv=Path("data/live_trades.csv"),
+            ticks_dir=ticks_dir,
+            output_csv=output_csv,
+        )
+        self.missed_tracker.start(interval_seconds=300)
+        self._log(
+            f"[INIT] Missed-trades watchdog started "
+            f"(ticks={ticks_dir}, out={output_csv})")
+
     def _tick(self):
         """Single iteration of the main loop."""
 
@@ -1940,7 +2288,7 @@ class TradingBot:
                     self._maybe_trade(market, strats, asset_key=key,
                                       cell_params=cell_params)
 
-        # 2a. Refresh RR market cache for the fast path (every 10s)
+        # 2a. Refresh RR market cache for the fast path (internal 5s guard)
         self._refresh_rr_cache()
 
         # 3. Display status for primary asset
@@ -2043,11 +2391,40 @@ class TradingBot:
         except Exception:
             pass  # Don't let price saving crash the bot
 
+    def _log_submission_timing(self, ticker: str, t0: float, stages: dict) -> None:
+        """Emit a single [TIMING] line showing ms deltas through the
+        submission flow. Stages is an insertion-ordered dict of
+        {step_name: monotonic_ts}. A zero-ms stage is usually just a
+        branch that took the local path — still worth logging to show
+        the shape of the flow."""
+        if not stages:
+            return
+        parts = []
+        prev = t0
+        last_ts = t0
+        for name, ts in stages.items():
+            parts.append(f"{name}={int((ts - prev) * 1000)}ms")
+            prev = ts
+            last_ts = ts
+        parts.append(f"total={int((last_ts - t0) * 1000)}ms")
+        self._log(f"  [TIMING] {ticker}: " + " ".join(parts))
+
     def _maybe_trade(self, market: dict, strategies_status: dict, asset_key: str = "",
-                     cell_params: dict = None):
-        """Check if any strategy wants to trade and execute if approved."""
+                     cell_params: dict = None, hit_ctx: Optional[dict] = None):
+        """Check if any strategy wants to trade and execute if approved.
+
+        `hit_ctx` is the per-candidate telemetry dict created at the
+        [FAST-RR] Hit site. Always pass it explicitly when dispatching
+        from a worker thread; the instance-attribute fallback is only
+        safe under single-threaded (sequential) execution.
+        """
+        _trade_t0 = time.monotonic()
+        _trade_stages: dict = {}
+        if hit_ctx is None:
+            hit_ctx = self._hit_ctx
         ticker = market.get("ticker", "")
         balance = self._get_balance()
+        _trade_stages["balance"] = time.monotonic()
 
         # Get fresh book prices for order placement — fetch the LIVE
         # orderbook, not the cached /markets data, so our limit price
@@ -2057,20 +2434,38 @@ class TradingBot:
              if a["scanner"].series in ticker),
             self.scanner,
         )
-        try:
-            book = scanner.client.get_orderbook(ticker, depth=1)
-            yes_bid, yes_ask = parse_book_top(book)
-            if yes_bid is not None and yes_ask is not None:
-                self._log(f"      [BOOK] {ticker}: yes_bid={yes_bid} yes_ask={yes_ask}")
-        except Exception:
-            # Fall back to cached market data
-            yes_bid, yes_ask = scanner.parse_yes_price(market)
+        # Maker mode (default) skips the fresh orderbook fetch — the
+        # fast-RR scanner already gave us current WS-backed bid/ask
+        # (with staleness check) on the `market` dict, and the ~100-500ms
+        # REST call here was the #1 source of "book moved" races. For
+        # maker, stale WS data just means our resting bid ends up at a
+        # now-unfavorable price; the order expires unfilled at no cost.
+        # For taker, we still need the fresh book because a stale ask
+        # can mean paying a bad price on immediate execution.
+        is_taker_mode = os.getenv("RR_TAKER", "0") == "1"
+        if is_taker_mode:
+            try:
+                book = scanner.client.get_orderbook(ticker, depth=1)
+                yes_bid, yes_ask = parse_book_top(book)
+                if yes_bid is not None and yes_ask is not None:
+                    self._log(f"      [BOOK] {ticker}: yes_bid={yes_bid} yes_ask={yes_ask}")
+            except Exception:
+                yes_bid, yes_ask = scanner.parse_yes_price(market)
+        else:
+            # Use the bid/ask the fast-RR scanner already validated.
+            yes_bid = market.get("yes_bid")
+            yes_ask = market.get("yes_ask")
+            if yes_bid is None or yes_ask is None:
+                # Fast-RR shouldn't have reached here without valid
+                # prices, but guard against a bad market dict anyway.
+                yes_bid, yes_ask = scanner.parse_yes_price(market)
+        _trade_stages["book"] = time.monotonic()
 
         # Latch fresh book values onto the hit context so every downstream
         # outcome row captures the book the decision was made against.
-        if self._hit_ctx is not None:
-            self._hit_ctx["yes_bid_c"] = yes_bid
-            self._hit_ctx["yes_ask_c"] = yes_ask
+        if hit_ctx is not None:
+            hit_ctx["yes_bid_c"] = yes_bid
+            hit_ctx["yes_ask_c"] = yes_ask
 
         # No sanity check — the fast-RR scanner already validated prices
         # via WS-cached bid/ask before reaching _maybe_trade. The old
@@ -2122,18 +2517,38 @@ class TradingBot:
                 ask_price = (100 - yes_bid) if yes_bid is not None else max_price
                 bid_price = (100 - yes_ask) if yes_ask is not None else (ask_price - 4)
 
-            if ask_price > max_price:
-                # Book collapsed between RR signal detection and the fresh
-                # orderbook fetch above — typical in the last 60-90s before
-                # settlement when a market resolves quickly. Log so dry
-                # spells are diagnosable without digging through debug feeds.
+            # Book-moved check. Prior to 2026-04-21 this skipped
+            # unconditionally whenever the fresh orderbook's ask
+            # exceeded the strategy's max_price. Analysis of 4/21
+            # showed this was throwing away ~50% of our trade decisions
+            # — the fast-RR scanner saw a valid 94-97c setup, but by
+            # the time _maybe_trade fetched a fresh orderbook the
+            # book had moved to 99-100c and we bailed.
+            #
+            # For TAKER mode this check is correct (we'd immediately
+            # fill at the new bad price). For MAKER mode (our default)
+            # it is overcautious: a maker bid at max_price just sits
+            # unfilled if the book doesn't come back, then expires —
+            # no loss, no fee. The 15s maker timeout already bounds
+            # our downside to wasted time.
+            is_taker = os.getenv("RR_TAKER", "0") == "1"
+            if is_taker and ask_price > max_price:
                 self._log(
-                    f"  [SKIP] {name}: {ticker} ask {ask_price}c > max {max_price}c "
+                    f"  [SKIP-TAKER] {name}: {ticker} ask {ask_price}c > max {max_price}c "
                     f"(book moved; yes_bid={yes_bid} yes_ask={yes_ask})"
                 )
                 self._record_skip(ticker, name, side, ask_price, max_price,
-                                  yes_bid, yes_ask)
+                                  yes_bid, yes_ask, hit_ctx=hit_ctx)
                 continue
+            if not is_taker and ask_price > max_price:
+                # Maker path: log so the behavior is visible on the
+                # dashboard + hit_outcomes.csv, but proceed to post
+                # the resting bid at max_price. It will either fill
+                # on a book-reversal or expire at 15s.
+                self._log(
+                    f"  [BOOK-MOVED-MAKER] {name}: {ticker} ask {ask_price}c > max "
+                    f"{max_price}c — posting resting maker bid at max_price"
+                )
 
             # RR order mode: default is MAKER (post at bid, no fees).
             # Kalshi maker fees are $0, and maker fills are cheaper by the
@@ -2144,13 +2559,19 @@ class TradingBot:
             #
             # Flip to taker by setting RR_TAKER=1 if you need guaranteed
             # fills on a given cell.
-            if os.getenv("RR_TAKER", "0") == "1":
+            if is_taker:
                 exec_price = min(ask_price, max_price)
                 is_maker = False
             else:
                 # Post at bid side, bounded by the cell's contract-price band.
                 # On a book with yes_bid=96, yes_ask=97 this posts a resting
                 # buy at 96c that fills only when a counterparty crosses.
+                #
+                # When the book has moved above max_price (bid_price >
+                # max_price), clamp to max_price so the resting order
+                # still conforms to the strategy's ceiling — waits for
+                # the book to reverse to our price or expires. This is
+                # the behavior we want in the "book-moved" case.
                 cp = cell_params or {}
                 cell_min_cp = cp.get("min_contract_price", 95)
                 maker_price = max(bid_price, cell_min_cp)
@@ -2178,6 +2599,7 @@ class TradingBot:
                     "skip_outside_band",
                     reason=f"exec {exec_price}c not in [{strat_min},{strat_max}]",
                     exec_price_c=exec_price,
+                    hit_ctx=hit_ctx,
                 )
                 continue
 
@@ -2203,6 +2625,30 @@ class TradingBot:
                     "skip_risk_rejected",
                     reason=reason,
                     exec_price_c=exec_price,
+                    hit_ctx=hit_ctx,
+                )
+                continue
+            _trade_stages["risk"] = time.monotonic()
+
+            # Safety margin vs settlement. A place_order + 15s fill-wait +
+            # cleanup (cancel, taker-fallback) needs ~15-25s. If there
+            # isn't enough runway left, skip the entry — the order would
+            # otherwise time out with the market already closed and the
+            # bot charged for a cancelled order it never actually filled.
+            # MIN_FLOW_SECS is the smallest window that can complete a
+            # sane order flow; at secs < this we were logging [CANCEL]
+            # every time and nothing ever filled.
+            MIN_FLOW_SECS = 15
+            secs_remaining = scanner.seconds_until_close(market)
+            if secs_remaining < MIN_FLOW_SECS:
+                self._log(
+                    f"  [SKIP] {name}: {ticker} too close to settlement "
+                    f"({secs_remaining:.1f}s < {MIN_FLOW_SECS}s flow budget)")
+                self._log_hit_outcome(
+                    "skip_too_close",
+                    reason=f"{secs_remaining:.1f}s < {MIN_FLOW_SECS}s",
+                    exec_price_c=exec_price,
+                    hit_ctx=hit_ctx,
                 )
                 continue
 
@@ -2230,6 +2676,7 @@ class TradingBot:
                         "skip_balance_low",
                         reason=f"balance ${balance:.2f} < 1 contract @ {exec_price}c",
                         exec_price_c=exec_price,
+                        hit_ctx=hit_ctx,
                     )
                     continue
                 new_contracts = int(balance / price_frac)
@@ -2256,8 +2703,10 @@ class TradingBot:
                     reason=f"EV=${expected_value:.2f} fees=${entry_fee:.2f}",
                     exec_price_c=exec_price,
                     stake_usd=round(stake, 2),
+                    hit_ctx=hit_ctx,
                 )
                 continue
+            _trade_stages["ev"] = time.monotonic()
 
             # Execute — mark ticker BEFORE placing order to prevent re-entry
             # For daily markets, mark the event prefix to block all strikes in this event
@@ -2357,6 +2806,13 @@ class TradingBot:
                     )
 
                 order_id = result.get("order", {}).get("order_id", client_oid)
+                _trade_stages["submit"] = time.monotonic()
+
+                # Balance just changed (locked stake). Invalidate the
+                # cache so the next call fetches fresh — otherwise the
+                # balance gate could approve a stacking order against
+                # stale pre-trade balance.
+                self.invalidate_balance_cache()
 
                 # Reserve the order_id in the CSV immediately. Closes the
                 # reconcile race: the reconcile thread scans `all_oids` from
@@ -2405,9 +2861,13 @@ class TradingBot:
                         # Reserve enough time for taker fallback
                         taker_reserve = cell_min_secs + 10
                         if is_maker:
-                            # Maker wait = time left minus taker reserve,
-                            # bounded by reasonable limits
-                            max_wait = max(5, min(120, int(secs_in_window - taker_reserve)))
+                            # Maker wait: bounded by 30s. Longer waits
+                            # rarely convert (a resting bid unfilled
+                            # after 30s is usually getting passed by)
+                            # and block iteration through newer setups.
+                            # Unfilled orders cancel at no P&L cost; we
+                            # then try taker fallback if there's room.
+                            max_wait = max(5, min(30, int(secs_in_window - taker_reserve)))
                         else:
                             # Taker: shorter patience, we expect immediate fills
                             if secs_in_window > 300:
@@ -2457,6 +2917,29 @@ class TradingBot:
                                 if cur_status in ("executed", "filled"):
                                     filled = True
                                     break
+
+                                # Drift check: if the book's current ask has
+                                # moved ≥2c above our resting maker bid, the
+                                # market has walked away from us. Cancel and
+                                # go to taker fallback rather than waste the
+                                # rest of the wait window. Only checked after
+                                # a short settle period so a one-tick flicker
+                                # doesn't trip it. WS-backed, zero REST cost.
+                                if (is_maker and wait_round >= 5
+                                        and wait_round % 3 == 0):
+                                    cur_bid, cur_ask = scanner.parse_yes_price(market)
+                                    if cur_bid is not None and cur_ask is not None:
+                                        ref_ask = (cur_ask if side == "yes"
+                                                   else 100 - cur_bid)
+                                        drift = ref_ask - exec_price
+                                        if drift >= 2:
+                                            self._log(
+                                                f"      [DRIFT] Book moved "
+                                                f"{drift}c away from maker bid "
+                                                f"@ {exec_price}c (ref ask "
+                                                f"{ref_ask}c) — abandoning "
+                                                f"maker at {wait_round + 1}s")
+                                            break
                             except Exception as e:
                                 self._log(f"      [WARN] Fill check failed: {e}", level="warning")
 
@@ -2553,6 +3036,9 @@ class TradingBot:
                                     reason=f"CANCELLED: unfilled after {max_wait}s",
                                     confidence=rec.confidence,
                                 )
+                                _trade_stages["wait"] = time.monotonic()
+                                self._log_submission_timing(
+                                    ticker, _trade_t0, _trade_stages)
                                 continue
 
                 self._log(f"      Order placed: {order_id}")
@@ -2561,6 +3047,7 @@ class TradingBot:
                     reason=order_id,
                     exec_price_c=exec_price,
                     stake_usd=round(stake, 2),
+                    hit_ctx=hit_ctx,
                 )
 
                 # Reconcile with actual fills from Kalshi —
@@ -2601,6 +3088,9 @@ class TradingBot:
                                     self._log(f"      [FILL] Classified as MAKER (fees=${entry_fee:.2f})")
                     except Exception as e:
                         self._log(f"      [WARN] Fill reconciliation failed: {e}", level="warning")
+
+                _trade_stages["wait"] = time.monotonic()
+                self._log_submission_timing(ticker, _trade_t0, _trade_stages)
 
                 # Record trade
                 record = TradeRecord(
@@ -3050,6 +3540,9 @@ class TradingBot:
                     "max_adverse_momentum": rr.max_adverse_momentum,
                     "max_stake_usd": self.config["stake_usd"],
                 },
+                # Publish ALL cells (safe + disabled) so the dashboard can
+                # show *why* a cell isn't trading instead of falling back to
+                # defaults silently. `enabled` = cleared the safety gate.
                 "per_cell": {k: {
                     # Raw numeric fields — dashboard formats these. Units:
                     #   *_contract_price / *_entry_price → cents (int)
@@ -3072,7 +3565,9 @@ class TradingBot:
                     "vol_gate": v.get("max_realized_vol_pct"),
                     "cv_wr": v.get("cv_mean_win_rate"),
                     "cv_trades": v.get("cv_total_val_trades", 0),
-                } for k, v in self._rr_cell_params.items()},
+                    "enabled": bool(v.get("enabled", False)),
+                    "disabled_reason": v.get("disabled_reason"),
+                } for k, v in self._rr_cell_params_all.items()},
             } if (rr := self.strategies.get("resolution_rider")) else {},
         }
 
@@ -3173,7 +3668,8 @@ class TradingBot:
 
     def _record_skip(self, ticker: str, strategy: str, side: str,
                      ask_price: int, max_price: int,
-                     yes_bid: Optional[int], yes_ask: Optional[int]):
+                     yes_bid: Optional[int], yes_ask: Optional[int],
+                     hit_ctx: Optional[dict] = None):
         """Compatibility shim — the book-moved path was the first
         instrumented skip. Now routed through _log_hit_outcome so every
         skip reason lands in hit_outcomes.csv uniformly."""
@@ -3182,16 +3678,19 @@ class TradingBot:
             reason="ask_gt_max",
             ask_price_c=ask_price,
             yes_bid_c=yes_bid, yes_ask_c=yes_ask,
+            hit_ctx=hit_ctx,
         )
 
-    def _log_hit_outcome(self, outcome: str, reason: str = "", **extras):
+    def _log_hit_outcome(self, outcome: str, reason: str = "",
+                         hit_ctx: Optional[dict] = None, **extras):
         """Write one row to hit_outcomes.csv describing what happened to
-        the last [FAST-RR] Hit. Called from the Hit site (to set ctx) and
-        from every exit point in _maybe_trade (to finalize it).
+        a [FAST-RR] Hit. Callers pass their candidate's hit_ctx dict
+        (required for correct attribution under parallel dispatch); if
+        omitted, falls back to the instance attribute for backward compat.
 
-        Falls back to a minimal row if ctx wasn't set — keeps auditing
+        Falls back to a minimal row if ctx is absent — keeps auditing
         honest even if a code path bypasses the Hit→ctx setup."""
-        ctx = self._hit_ctx or {}
+        ctx = hit_ctx if hit_ctx is not None else (self._hit_ctx or {})
         now_iso = datetime.now(timezone.utc).isoformat()
         row = {
             "time": ctx.get("time", now_iso),
@@ -3210,20 +3709,23 @@ class TradingBot:
             "cell": ctx.get("cell", ""),
         }
 
-        # Append to CSV (best-effort; never crash the trade loop on IO).
+        # Append to CSV under a dedicated lock — multiple parallel
+        # submissions can land here at once.
         try:
-            with open(self._hit_outcomes_csv, "a", newline="") as f:
-                csv.writer(f).writerow([
-                    row["time"], row["ticker"], row["strategy"], row["side"],
-                    row["max_price_c"], row["yes_bid_c"], row["yes_ask_c"],
-                    row["outcome"], row["reason"],
-                    row["ask_price_c"], row["exec_price_c"], row["stake_usd"],
-                    row["secs_left"], row["cell"],
-                ])
+            with self._hit_outcomes_lock:
+                with open(self._hit_outcomes_csv, "a", newline="") as f:
+                    csv.writer(f).writerow([
+                        row["time"], row["ticker"], row["strategy"], row["side"],
+                        row["max_price_c"], row["yes_bid_c"], row["yes_ask_c"],
+                        row["outcome"], row["reason"],
+                        row["ask_price_c"], row["exec_price_c"], row["stake_usd"],
+                        row["secs_left"], row["cell"],
+                    ])
         except Exception:
             pass
 
-        # Rolling 24h counter for dashboard summary.
+        # Rolling 24h counter for dashboard summary. Dict mutations are
+        # GIL-atomic for simple assignment/increment.
         if time.time() - self._hit_outcome_window_start > 86400:
             self._hit_outcome_counts = {}
             self._hit_outcome_window_start = time.time()
@@ -3247,9 +3749,11 @@ class TradingBot:
             if len(self._recent_skips) > 50:
                 self._recent_skips = self._recent_skips[-50:]
 
-        # Clear the context so a later exit in a nested call doesn't
-        # accidentally log against a stale hit.
-        self._hit_ctx = None
+        # Clear the instance-level ctx only when we were using it.
+        # Callers that passed an explicit hit_ctx manage their own
+        # state; clearing the instance attr would cross-wire threads.
+        if hit_ctx is None:
+            self._hit_ctx = None
 
     def _write_heartbeat(self, status: str = "running"):
         """Write heartbeat file for external monitoring."""
@@ -3443,27 +3947,24 @@ class TradingBot:
 
         enable_all = os.environ.get("RR_ENABLE_ALL", "0") == "1"
 
-        def _cell_is_safe(v: dict) -> bool:
-            if enable_all:
-                return (v.get("cv_total_val_trades", 0) >= 10
-                        or v.get("training_trades", 0) >= 5)
-            if v.get("cv_folds", 0) == 0:
-                return v.get("training_profit", 0) > 0
-            wr_lb = v.get("cv_wr_lower_bound", 0)
-            trades = v.get("cv_total_val_trades", 0)
-            profit = v.get("cv_val_profit", -999)
-            if trades < 30:
-                return False
-            if wr_lb >= 0.93:
-                return True
-            if profit > 0 and wr_lb >= 0.80:
-                return True
-            min_cp = v.get("min_contract_price", 95)
-            if wr_lb >= (min_cp / 100.0) and trades >= 50:
-                return True
-            return False
+        # Refresh 7-day live P&L on reload so the gate reflects the
+        # latest trade results (the nightly cron, a manual SIGHUP, or
+        # the bot starting up after a bad run all see current reality).
+        pnl_by_cell = load_recent_cell_pnl(days=7)
 
-        safe_cells = {k: v for k, v in all_rr_params.items() if _cell_is_safe(v)}
+        safe_cells = {}
+        annotated = {}
+        for k, v in all_rr_params.items():
+            ok, reason = evaluate_cell_safety(
+                k, v, pnl_by_cell=pnl_by_cell, enable_all=enable_all)
+            # Per-cell optimizer params pass through directly; strategy-
+            # level clamps at max_ep≤97 and min_buf≥0.15 guard the two
+            # known failure modes without neutering the per-cell tuning.
+            merged = dict(v)
+            annotated[k] = {**merged, "enabled": ok,
+                            "disabled_reason": reason or None}
+            if ok:
+                safe_cells[k] = merged
         prev_cells = set(self._rr_cell_params.keys())
         new_cells = set(safe_cells.keys())
         added = sorted(new_cells - prev_cells)
@@ -3471,6 +3972,7 @@ class TradingBot:
 
         # Atomic swap — never leave the bot in a half-updated state.
         self._rr_cell_params = safe_cells
+        self._rr_cell_params_all = annotated
         self._log(f"[RELOAD] RR params reloaded: {len(safe_cells)} safe cells")
         if added:
             self._log(f"[RELOAD] newly enabled: {', '.join(added)}")

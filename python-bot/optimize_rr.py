@@ -96,6 +96,62 @@ def get_slippage_cents(entry_price_cents: int) -> float:
     return SLIPPAGE_MODEL.get(entry_price_cents, 0.5)
 
 
+# Global fill-rate model (fit from live_trades.csv by fit_fill_rate.py).
+# Loaded once at optimizer startup so simulate_fast can weight each
+# simulated trade's profit by realistic fill probability instead of
+# assuming every gate-pass becomes a fill at the posted price. Without
+# this the optimizer converges on absurdly tight windows (45-60s,
+# max_seconds=60) because the simulator doesn't pay the IOC-cancel cost
+# those tight windows incur live.
+FILL_RATE_MODEL: dict = {}
+
+
+def get_fill_probability(entry_price_cents: int, secs_left: float) -> float:
+    """P(fill | price, secs_left) from the fitted logistic model.
+
+    Returns 1.0 when no model is loaded or when DISABLE_FILL_MODEL=1 —
+    that's the legacy behavior and a useful ablation knob. Otherwise
+    returns sigmoid(a + b*price + c*secs) clipped to [fill_min, fill_max]
+    so the optimizer can't exploit made-up regions far outside the
+    training distribution.
+    """
+    if os.getenv("DISABLE_FILL_MODEL", "0") == "1" or not FILL_RATE_MODEL:
+        return 1.0
+    a = FILL_RATE_MODEL["a"]
+    b = FILL_RATE_MODEL["b"]
+    c = FILL_RATE_MODEL["c"]
+    logit = a + b * entry_price_cents + c * secs_left
+    # Clamp the logit before the exp to avoid overflow at extreme
+    # values; ±50 maps to probabilities indistinguishable from 0/1.
+    if logit > 50:
+        p = 1.0
+    elif logit < -50:
+        p = 0.0
+    else:
+        p = 1.0 / (1.0 + math.exp(-logit))
+    lo = FILL_RATE_MODEL.get("fill_min", 0.3)
+    hi = FILL_RATE_MODEL.get("fill_max", 1.0)
+    return max(lo, min(hi, p))
+
+
+def load_fill_rate_model(data_dir: str) -> dict:
+    """Load data/fill_rate_model.json if it exists. Idempotent — called
+    from main() at startup and safe to call again in workers that were
+    spawned before the global was populated."""
+    path = Path(data_dir) / "fill_rate_model.json"
+    if not path.exists():
+        # Also try the bot's default data dir for the dev workflow
+        alt = Path(__file__).parent / "data" / "fill_rate_model.json"
+        if alt.exists():
+            path = alt
+        else:
+            return {}
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 # ── Parameter Space ───────────────────────────────────────────────
 
 PARAM_RANGES = {
@@ -120,10 +176,11 @@ MIN_VAL_TRADES_PER_FOLD = int(os.getenv("MIN_VAL_TRADES_PER_FOLD", "0"))
 
 # Minimum aggregate validation trades across all folds. With walk-forward,
 # a cell needs at least this many total validated samples to even attempt
-# a fit. Raised to 30 so the optimizer's viability bar matches the bot's
-# enablement filter (bot.py also requires trades >= 30), preventing
-# low-sample candidates from getting saved but then filtered out anyway.
-MIN_TOTAL_VAL_TRADES = int(os.getenv("MIN_TOTAL_VAL_TRADES", "30"))
+# a fit. Lowered to 15 on 2026-04-22 — 30 was ruling out viable-but-rare
+# setups on tight-gate cells and was a meaningful contributor to thin
+# trade volume. 15 still gives Wilson LB a big enough sample to punish
+# the noisy candidates on its own.
+MIN_TOTAL_VAL_TRADES = int(os.getenv("MIN_TOTAL_VAL_TRADES", "15"))
 
 # Wilson score z for the CV lower bound. 1.96 = 95% one-sided, 2.58 = 99%,
 # 1.0 ≈ 68%. Higher z = more conservative (prefers larger samples more).
@@ -140,6 +197,64 @@ WF_MIN_DATES = int(os.getenv("WF_MIN_DATES", "6"))  # below this, skip CV
 # every RECENCY_HALFLIFE_FOLDS steps back. Set to a large number to
 # effectively disable recency weighting.
 RECENCY_HALFLIFE_FOLDS = float(os.getenv("RECENCY_HALFLIFE_FOLDS", "3.0"))
+
+# Risk tolerance — global knob that reshapes the optimizer's score to
+# reward trade volume alongside win rate + PPT. The existing score,
+# ALPHA*WR + (1-ALPHA)*norm_PPT, is volume-agnostic because PPT
+# normalizes profit per trade. That's why the optimizer converges on
+# narrow-window strategies (45-60s) — they produce few high-WR trades
+# that dominate PPT even when a wider-window strategy would earn far
+# more total dollars.
+#
+# With RISK_TOLERANCE>0, the score becomes:
+#   ALPHA*WR + (1-ALPHA)*norm_PPT + RISK_TOLERANCE * norm_TRADES
+# where norm_TRADES = min(1, trades / TRADE_VOL_NORM). The optimizer
+# still cannot pick money-losing params — CV's Wilson LB gate still
+# filters those out — but when ranking *viable* candidates it prefers
+# higher-volume ones proportional to RISK_TOLERANCE.
+#
+# Guide:
+#   0.0   — legacy behavior, pure WR+PPT (default)
+#   0.1   — mild preference for volume
+#   0.3   — noticeably prefers higher-volume strategies
+#   0.5+  — aggressive, volume-dominant
+RISK_TOLERANCE = float(os.getenv("RISK_TOLERANCE", "0.0"))
+TRADE_VOL_NORM = float(os.getenv("TRADE_VOL_NORM", "500.0"))
+
+# ── Maker-order simulation ───────────────────────────────────────
+# The simulator defaults to taker semantics (fill at observed ask,
+# pay a fee). Set ORDER_MODE=maker to simulate resting limit orders:
+# the candidate posts a bid `maker_bid_offset` cents below the current
+# ask, and the trade fills only if the market's side-appropriate ask
+# walks down to the bid within `maker_timeout` seconds (otherwise the
+# order expires with zero P&L).
+#
+# Maker flips the edge math: entry price drops by the offset, fees go
+# to zero (Kalshi charges $0 for maker fills), but fills are adverse-
+# selected (the only way to get filled is for the price to move against
+# the typical RR thesis) and rarer (the market must actually come back).
+# Whether maker beats taker is cell-dependent — run the optimizer in
+# each mode and compare.
+ORDER_MODE = os.getenv("ORDER_MODE", "taker").strip().lower()
+# Maker and taker are both CUDA-backed (see optimize_rr_cuda.py
+# score_candidates — maker_fill mask at ~line 290 and bid-priced
+# execution at ~line 355). Narrow defaults keep the maker candidate
+# grid tractable on CPU-only boxes, but they can be widened freely
+# via env vars when CUDA is available.
+MAKER_OFFSETS = tuple(
+    int(x) for x in os.getenv("MAKER_OFFSETS", "0,1,2,3").split(",") if x.strip()
+)
+MAKER_TIMEOUTS = tuple(
+    int(x) for x in os.getenv("MAKER_TIMEOUTS", "60,120").split(",") if x.strip()
+)
+
+# Restrict the per-cell CV loop to a subset of cells. Useful for
+# focused maker-mode runs: `CELL_FILTER=btc_hourly,bnb_hourly` runs
+# just those two, letting CPU-only maker finish in minutes instead
+# of hours. Empty = run every cell.
+CELL_FILTER = tuple(
+    c.strip() for c in os.getenv("CELL_FILTER", "").split(",") if c.strip()
+)
 
 
 def wilson_lower_bound(wins: int, n: int, z: float = WILSON_Z) -> float:
@@ -189,28 +304,61 @@ VOL_LOOKBACK = 300
 # to break even even with $0 fees, and empirical WR is ~97-98% —
 # 99c entries are consistent money losers in tick-level data).
 # Minimum band width = 3c so the band is tradeable in live.
-MIN_CONTRACT_PRICE_FLOOR = 88
+MIN_CONTRACT_PRICE_FLOOR = int(os.getenv("MIN_CONTRACT_PRICE_FLOOR", "88"))
 MAX_ENTRY_PRICE_CEIL = 98
 MIN_BAND_WIDTH = 3
 
 
-def sample_params() -> dict:
+# Floor for min_seconds across all cells. The strategy holds to
+# settlement, but the final few seconds are dominated by Kalshi's
+# settlement-processing latency and not safe to enter. 10s is the
+# same floor the live bot uses.
+MIN_SECONDS_FLOOR = 10
+# Safe fallback when horizon analysis has no samples for a cell (new
+# market families, first-run case). Conservative middle ground — the
+# optimizer can still trade, but won't reach into noisy long-horizon
+# territory until the data justifies it.
+DEFAULT_MAX_SECONDS = 120
+
+
+def sample_params(max_seconds_cap: int = DEFAULT_MAX_SECONDS) -> dict:
     # Parameter importance ranking (from analyze_param_importance.py):
     #   1. momentum  (40.1% WR spread) — search aggressively
     #   2. buffer    (38.9% WR spread) — search aggressively
-    #   3. secs_left (14.4% WR spread) — search moderately
+    #   3. secs_left (14.4% WR spread) — searched within an empirical
+    #      per-cell ceiling from analyze_safe_horizon.compute_horizons.
+    #      Cap, not a fixed value: the optimizer still picks the sweet
+    #      spot inside the data-supported range.
     #   4. entry_price (4.7%) — set wide, don't over-constrain
     #   5. realized_vol (4.3%) — disabled (not predictive)
     mcp = random.choice([88, 89, 90, 91, 92, 93, 94, 95])
     mep = random.choice([96, 97, 98])
     if mep - mcp < MIN_BAND_WIDTH:
         mcp = mep - MIN_BAND_WIDTH
-    p = {
+    # Max-seconds choices limited to the cell's horizon ceiling. At
+    # horizon=90, options are {60, 90}; at 120, {60, 90, 120}; etc.
+    ms_choices = [ms for ms in (60, 90, 120, 180, 240, 300, 480, 600)
+                  if ms <= max_seconds_cap]
+    if not ms_choices:
+        ms_choices = [max_seconds_cap]
+    ms = random.choice(ms_choices)
+    # Min-seconds is hardcoded to MIN_SECONDS_FLOOR. Previously
+    # searched over {10, 15, 30, 45}, but the optimizer was picking
+    # values like 45 on cells whose own horizon data showed >93%
+    # correctness in the 0-30s bucket — leaving real trades on the
+    # table. Pinning to 10 removes that over-restriction; the buffer
+    # and momentum gates still block unsafe entries.
+    maker_offset = random.choice(MAKER_OFFSETS) if ORDER_MODE == "maker" else 0
+    maker_timeout = (random.choice(MAKER_TIMEOUTS)
+                     if ORDER_MODE == "maker" else MAKER_TIMEOUTS[0])
+    return {
         "min_contract_price": mcp,
         "max_entry_price": mep,
-        # Time: moderate search (rank #3)
-        "min_seconds": random.choice([10, 15, 30, 45]),
-        "max_seconds": random.choice([60, 90, 120, 180, 240, 300, 480, 600]),
+        "min_seconds": MIN_SECONDS_FLOOR,
+        "max_seconds": ms,
+        "order_mode": ORDER_MODE,
+        "maker_bid_offset": maker_offset,
+        "maker_timeout": maker_timeout,
         # Buffer: fine-grained search (rank #2)
         "min_price_buffer_pct": round(random.uniform(0.03, 0.60), 3),
         # Momentum: fine-grained search (rank #1)
@@ -221,9 +369,6 @@ def sample_params() -> dict:
         "max_realized_vol_pct": None,
         "vol_lookback": VOL_LOOKBACK,
     }
-    if p["min_seconds"] >= p["max_seconds"]:
-        p["min_seconds"] = 10
-    return p
 
 
 def perturb_around(anchor: dict, n: int) -> list[dict]:
@@ -298,34 +443,50 @@ def perturb_around(anchor: dict, n: int) -> list[dict]:
     return out
 
 
-def grid_params() -> list[dict]:
+def grid_params(max_seconds_cap: int = DEFAULT_MAX_SECONDS) -> list[dict]:
+    """Exhaustive sweep over the parameters that actually encode edge.
+
+    Time bounds (`min_seconds`, `max_seconds`) are still searched, but
+    `max_seconds` is clipped to `max_seconds_cap` — the cell's empirical
+    horizon from `analyze_safe_horizon.compute_horizons`. At horizon=90,
+    candidates sweep max_seconds over {60, 90} only; at horizon=120,
+    over {60, 90, 120}; etc. This is meaningfully smaller than the
+    unclipped 8-value search but still lets the optimizer find tighter
+    windows when CV prefers them.
+
+    `GRID_MODE=small` reverts to a coarse price-band set for fast CPU runs.
+    """
     combos = []
-    # Full exhaustive sweep across every dimension within the configured
-    # bounds. Tractable now that the CUDA backend clears ~10k candidates/s
-    # on an RTX 3070 — a ~1.09M sweep finishes in ~2 min per cell.
-    # GRID_MODE=small reverts to the 107k-candidate coarse grid for CPU
-    # runs or fast smoke tests.
     mode = os.environ.get("GRID_MODE", "full").lower()
     if mode == "small":
         band_choices = [
             (90, 98), (92, 98), (93, 98), (95, 98),
             (90, 96), (92, 96), (93, 97),
         ]
-        time_choices = [(10, 90), (10, 180), (10, 300),
-                        (15, 60), (15, 120), (30, 180),
-                        (30, 300), (45, 90), (45, 600)]
     else:
         band_choices = [
             (mcp, mep)
             for mep in (96, 97, 98)
             for mcp in range(MIN_CONTRACT_PRICE_FLOOR, mep - MIN_BAND_WIDTH + 1)
         ]
-        time_choices = [
-            (mins, ms)
-            for mins in (10, 15, 30, 45)
-            for ms in (60, 90, 120, 180, 240, 300, 480, 600)
-            if mins < ms
-        ]
+    # min_seconds is hardcoded to MIN_SECONDS_FLOOR (not searched).
+    # See sample_params() for rationale — the old search over
+    # {10, 15, 30, 45} was over-restricting cells whose data showed
+    # 0-30s entries were safe. Grid only varies max_seconds within
+    # the cell's horizon cap.
+    time_choices = [
+        (MIN_SECONDS_FLOOR, ms)
+        for ms in (60, 90, 120, 180, 240, 300, 480, 600)
+        if MIN_SECONDS_FLOOR < ms and ms <= max_seconds_cap
+    ]
+    if not time_choices:
+        time_choices = [(MIN_SECONDS_FLOOR, max_seconds_cap)]
+    # Maker dims — only searched when ORDER_MODE=maker; otherwise
+    # fixed so the grid doesn't multiply out uselessly.
+    if ORDER_MODE == "maker":
+        maker_choices = [(o, t) for o in MAKER_OFFSETS for t in MAKER_TIMEOUTS]
+    else:
+        maker_choices = [(0, MAKER_TIMEOUTS[0])]
     for mcp, mep in band_choices:
         for mins, ms in time_choices:
             for buf in [0.05, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]:
@@ -333,18 +494,22 @@ def grid_params() -> list[dict]:
                             -0.02, -0.01, -0.005, 0.0]:
                     for mw in (30, 60, 90, 120, 180, 300):
                         for mp in (3, 4, 5, 6, 7, 8, 9, 10):
-                            combos.append({
-                                "min_contract_price": mcp,
-                                "max_entry_price": mep,
-                                "min_seconds": mins,
-                                "max_seconds": ms,
-                                "min_price_buffer_pct": buf,
-                                "max_adverse_momentum": mom,
-                                "momentum_window": mw,
-                                "momentum_periods": mp,
-                                "max_realized_vol_pct": None,
-                                "vol_lookback": VOL_LOOKBACK,
-                            })
+                            for m_off, m_to in maker_choices:
+                                combos.append({
+                                    "min_contract_price": mcp,
+                                    "max_entry_price": mep,
+                                    "min_seconds": mins,
+                                    "max_seconds": ms,
+                                    "min_price_buffer_pct": buf,
+                                    "max_adverse_momentum": mom,
+                                    "momentum_window": mw,
+                                    "momentum_periods": mp,
+                                    "max_realized_vol_pct": None,
+                                    "vol_lookback": VOL_LOOKBACK,
+                                    "order_mode": ORDER_MODE,
+                                    "maker_bid_offset": m_off,
+                                    "maker_timeout": m_to,
+                                })
     return combos
 
 
@@ -911,22 +1076,68 @@ def preprocess_window(window: dict, crypto_prices: dict) -> Optional[dict]:
         if approx_strike and approx_strike > 0:
             strike = approx_strike
 
-    # Extract all potentially tradeable ticks (broadly: 94-99c, 10-500s)
-    entries = []
+    # First pass: build a full (ts_epoch, yes_bid, yes_ask) tick stream,
+    # sorted by time. Needed downstream for maker-order fill simulation —
+    # a maker bid posted at tick i fills only if some later tick j (within
+    # the maker timeout) has an ask ≤ our bid. We precompute the forward-
+    # window min/max once per window so simulate_fast does O(1) lookups.
+    raw_stream = []
     for tick in ticks:
         ts = tick["timestamp"]
         if isinstance(ts, str):
             ts = pd.Timestamp(ts)
         if hasattr(ts, 'tzinfo') and ts.tzinfo is None:
             ts = ts.tz_localize("UTC")
+        yb = tick.get("yes_bid", 0)
+        ya = tick.get("yes_ask", 0)
+        if not yb or not ya:
+            continue
+        raw_stream.append((ts.timestamp(), int(yb), int(ya), ts))
+    raw_stream.sort(key=lambda x: x[0])
 
+    # Precompute forward-window min(yes_ask) and max(yes_bid) for each
+    # maker timeout. For tick i, min_ask[t][i] = cheapest ask any time
+    # in (ts[i], ts[i]+t]. Used by simulate_fast: maker YES bid at P
+    # fills iff min_ask[t][i] ≤ P; maker NO bid at P fills iff
+    # 100 - max_bid[t][i] ≤ P, i.e., max_bid[t][i] ≥ 100 - P.
+    n_stream = len(raw_stream)
+    maker_ask_by_timeout: dict[int, np.ndarray] = {}
+    maker_bid_by_timeout: dict[int, np.ndarray] = {}
+    if n_stream > 0:
+        times = np.fromiter((r[0] for r in raw_stream), dtype=np.float64,
+                            count=n_stream)
+        bids_arr = np.fromiter((r[1] for r in raw_stream), dtype=np.int16,
+                                count=n_stream)
+        asks_arr = np.fromiter((r[2] for r in raw_stream), dtype=np.int16,
+                                count=n_stream)
+        for to in MAKER_TIMEOUTS:
+            end_idx = np.searchsorted(times, times + to, side='right')
+            ma = np.empty(n_stream, dtype=np.int16)
+            mb = np.empty(n_stream, dtype=np.int16)
+            for i in range(n_stream):
+                j = int(end_idx[i])
+                if j > i + 1:
+                    ma[i] = asks_arr[i + 1:j].min()
+                    mb[i] = bids_arr[i + 1:j].max()
+                else:
+                    # No future ticks in window — only an instant fill
+                    # at the current price would count; we store the
+                    # current-tick values so simulate_fast's "bid ≥ min
+                    # ask" check behaves like "bid ≥ current ask" (i.e.
+                    # only a taker-equivalent bid fills, no maker edge).
+                    ma[i] = asks_arr[i]
+                    mb[i] = bids_arr[i]
+            maker_ask_by_timeout[to] = ma
+            maker_bid_by_timeout[to] = mb
+
+    # Second pass: build per-entry dicts, only keeping ticks that
+    # plausibly look tradeable (94-99c, 10-500s left). Each entry
+    # carries an index back into raw_stream so simulate_fast can
+    # reach into the precomputed future windows.
+    entries = []
+    for i, (ts_epoch, yes_bid, yes_ask, ts) in enumerate(raw_stream):
         secs_left = (close_time - ts).total_seconds()
         if secs_left < 10 or secs_left > 500:
-            continue
-
-        yes_bid = tick.get("yes_bid", 50)
-        yes_ask = tick.get("yes_ask", 50)
-        if not yes_bid or not yes_ask:
             continue
 
         yes_mid = (yes_bid + yes_ask) / 2
@@ -953,7 +1164,6 @@ def preprocess_window(window: dict, crypto_prices: dict) -> Optional[dict]:
         momentum = None
         realized_vol = None
         if coin_prices:
-            ts_epoch = ts.timestamp() if hasattr(ts, 'timestamp') else float(ts)
             cp = get_price_at(coin_prices, ts_epoch)
             if cp:
                 if strike and strike > 0:
@@ -976,6 +1186,9 @@ def preprocess_window(window: dict, crypto_prices: dict) -> Optional[dict]:
             "buffer_pct": buffer_pct,
             "momentum": momentum,
             "realized_vol": realized_vol,
+            # Indexes into the window-level maker_{ask,bid}_by_timeout arrays.
+            # Cheaper than copying 8 ints per entry.
+            "stream_idx": i,
         })
 
     if not entries:
@@ -984,6 +1197,8 @@ def preprocess_window(window: dict, crypto_prices: dict) -> Optional[dict]:
     return {
         "result": result,
         "entries": entries,
+        "maker_ask_by_timeout": maker_ask_by_timeout,
+        "maker_bid_by_timeout": maker_bid_by_timeout,
     }
 
 
@@ -991,7 +1206,17 @@ def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
     """Fast simulation against pre-processed entries.
     Python loop with early-exit is net faster than numpy here — each
     window has only ~30-50 entries, and numpy's per-call overhead
-    exceeds the cost of a Python short-circuiting scan at that size."""
+    exceeds the cost of a Python short-circuiting scan at that size.
+
+    Taker semantics (default) vs maker semantics (ORDER_MODE=maker) is
+    selected by the `order_mode` param — taker fills at the observed
+    ask, pays a fee, and the fill probability is scaled by the logistic
+    model from fit_fill_rate. Maker fills at a bid posted
+    `maker_bid_offset` below the ask, pays no fee, and fills only if
+    the precomputed forward-window min-ask (for the candidate's
+    `maker_timeout`) is at-or-below the bid — binary fill, no P(fill)
+    scaling.
+    """
     min_cp = params["min_contract_price"]
     max_ep = params["max_entry_price"]
     min_secs = params.get("min_seconds", 10)
@@ -1000,6 +1225,9 @@ def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
     max_mom = params["max_adverse_momentum"]
     max_vol = params.get("max_realized_vol_pct")
     mom_key = (params.get("momentum_window", 60), params.get("momentum_periods", 5))
+    order_mode = params.get("order_mode", "taker")
+    maker_offset = params.get("maker_bid_offset", 0)
+    maker_timeout = params.get("maker_timeout", 60)
     result = preprocessed["result"]
 
     for e in preprocessed["entries"]:
@@ -1031,6 +1259,39 @@ def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
                     continue
 
         won = (e["side"] == result)
+
+        if order_mode == "maker":
+            # Post a bid `maker_offset` cents below the observed ask.
+            # Fill only if the forward-window min-ask (YES side) or
+            # min-no-ask (NO side, via max yes_bid) reaches our bid.
+            bid_price = int(e["entry_price"]) - maker_offset
+            if bid_price < 1:
+                continue
+            si = e["stream_idx"]
+            if e["side"] == "yes":
+                future_min_ask = preprocessed["maker_ask_by_timeout"][maker_timeout][si]
+                filled = future_min_ask <= bid_price
+            else:
+                # NO side: our NO bid at P sits at YES-ask = 100-P.
+                # Filled when someone posts a YES-bid ≥ 100-P, i.e.
+                # max future yes_bid ≥ 100 - bid_price.
+                future_max_bid = preprocessed["maker_bid_by_timeout"][maker_timeout][si]
+                filled = future_max_bid >= (100 - bid_price)
+            if not filled:
+                return None  # order expired unfilled
+            # Maker fills at OUR posted price, not the observed ask.
+            exec_price = bid_price
+            contracts = max(1, int(10.0 / (exec_price / 100.0)))
+            stake = contracts * exec_price / 100.0
+            # Zero fee + zero slippage on maker (we're the price-setter).
+            if won:
+                profit = contracts * (100 - exec_price) / 100.0
+            else:
+                profit = -contracts * exec_price / 100.0
+            return {"won": won, "profit": profit, "stake": stake,
+                    "p_fill": 1.0, "exec_price": exec_price}
+
+        # --- Taker path (legacy) ---
         contracts = max(1, int(10.0 / (e["entry_price"] / 100.0)))
         stake = contracts * e["entry_price"] / 100.0
         slippage_per_contract = get_slippage_cents(int(e["entry_price"])) / 100.0
@@ -1039,7 +1300,17 @@ def simulate_fast(preprocessed: dict, params: dict) -> Optional[dict]:
             profit = contracts * (100 - e["entry_price"]) / 100.0 - slippage_cost
         else:
             profit = -contracts * e["entry_price"] / 100.0 - slippage_cost
-        return {"won": won, "profit": profit, "stake": stake}
+        # Expected-value scaling by fill probability. Narrow time
+        # windows (low secs_left) get heavily penalized, which is the
+        # whole point: the optimizer currently prefers max_seconds=60
+        # because it can't see that half those orders die in IOC. A
+        # cancelled order earns $0, not the simulated profit, so the
+        # expected contribution is profit * P(fill). Unit stays the
+        # same, so downstream aggregation (PPT, score) doesn't need
+        # to know about the weighting.
+        p_fill = get_fill_probability(int(e["entry_price"]), e["secs_left"])
+        return {"won": won, "profit": profit * p_fill, "stake": stake,
+                "p_fill": p_fill}
 
     return None
 
@@ -1069,8 +1340,14 @@ def evaluate_params(preprocessed_windows: list[dict], params: dict) -> dict:
     total_profit = win_profit + loss_profit
     ppt = total_profit / trades
     norm_p = max(0, min(1, (ppt + 10) / 10.5))
+    # Volume bonus — RISK_TOLERANCE>0 rewards higher trade counts to
+    # counteract PPT's inherent volume-blindness. Kept separate from
+    # norm_p so a cell with strong PPT isn't over-rewarded for also
+    # having high volume (the scoring still caps at 1 via min()).
+    norm_t = min(1.0, trades / TRADE_VOL_NORM) if TRADE_VOL_NORM > 0 else 0.0
+    score = ALPHA * wr + (1 - ALPHA) * norm_p + RISK_TOLERANCE * norm_t
     return {
-        "score": round(ALPHA * wr + (1 - ALPHA) * norm_p, 6),
+        "score": round(score, 6),
         "win_rate": round(wr, 4),
         "trades": trades, "profit": round(total_profit, 2),
         "wins": wins, "losses": losses,
@@ -1330,6 +1607,34 @@ def main():
             print(f"    {price}c entry -> {slip:.2f}c slippage")
     else:
         print("  No slippage model loaded, using 0.5c default")
+
+    print(f"  Order mode: {ORDER_MODE.upper()}"
+          + (f" (search: bid_offset {MAKER_OFFSETS}, timeout {MAKER_TIMEOUTS}s)"
+             if ORDER_MODE == "maker" else ""))
+
+    # Load fill-rate model (fit by fit_fill_rate.py from live_trades.csv).
+    # When present, simulate_fast scales each candidate trade's profit by
+    # P(fill) so tight-window strategies aren't rewarded for fills they
+    # wouldn't actually get. Set DISABLE_FILL_MODEL=1 to ignore the
+    # model and recover legacy perfect-fill behavior.
+    global FILL_RATE_MODEL
+    FILL_RATE_MODEL = load_fill_rate_model(data_dir)
+    if FILL_RATE_MODEL and os.getenv("DISABLE_FILL_MODEL", "0") != "1":
+        m = FILL_RATE_MODEL
+        print(f"  Fill-rate model: n_fills={m.get('n_fills')} "
+              f"n_cancels={m.get('n_cancels')} "
+              f"clip=[{m.get('fill_min')}, {m.get('fill_max')}]")
+        print(f"    P(fill) grid (clipped):")
+        for pc in (92, 95, 97, 98):
+            row = [f"    {pc}c:"]
+            for s in (15, 30, 60, 120, 240):
+                row.append(f"{s}s={get_fill_probability(pc, s):.2f}")
+            print("  ".join(row))
+    elif os.getenv("DISABLE_FILL_MODEL", "0") == "1":
+        print("  Fill-rate model: DISABLED via env (using perfect-fill sim)")
+    else:
+        print("  No fill-rate model found — using perfect-fill sim "
+              "(run fit_fill_rate.py to generate one)")
     tick_dir = os.path.join(data_dir, "ticks")
     all_tick_windows = load_tick_windows(tick_dir) if Path(tick_dir).exists() else []
     print(f"  Ticks: {len(all_tick_windows)} market windows from live recorder")
@@ -1473,6 +1778,38 @@ def main():
     print(f"  {n_tradeable:,}/{sum(len(v) for v in windows_by_cell.values()):,} "
           f"have tradeable ticks (preprocessed in {time.time()-t_pp:.0f}s)")
 
+    # Empirical safe-entry horizon per cell. Removes min_seconds /
+    # max_seconds from the optimizer's search space: each cell gets a
+    # data-driven max_seconds based on where historical correctness
+    # drops below the configured threshold. Env knobs:
+    #   HORIZON_MIN_PRICE   — entry-price floor for the analysis (¢)
+    #   HORIZON_MIN_BUFFER  — favored-side buffer floor (%)
+    #   HORIZON_THRESHOLD   — correctness bar (default 0.97)
+    #   SKIP_HORIZON=1      — fall back to DEFAULT_MAX_SECONDS everywhere
+    from analyze_safe_horizon import (
+        compute_horizons, format_horizons_table, save_horizons,
+    )
+    print("\n  Computing per-cell safe-entry horizons...")
+    if os.getenv("SKIP_HORIZON", "0") == "1":
+        print("  SKIP_HORIZON=1 — using DEFAULT_MAX_SECONDS "
+              f"({DEFAULT_MAX_SECONDS}s) for every cell")
+        horizons = {cell: {
+            "max_seconds": DEFAULT_MAX_SECONDS, "from_default": True,
+            "n_samples": 0, "overall_correctness": None,
+        } for cell in all_cells}
+    else:
+        horizons = compute_horizons(
+            windows_by_cell,
+            min_price=int(os.getenv("HORIZON_MIN_PRICE", "95")),
+            min_buffer_pct=float(os.getenv("HORIZON_MIN_BUFFER", "0.10")),
+            threshold=float(os.getenv("HORIZON_THRESHOLD", "0.85")),
+            default_max_seconds=DEFAULT_MAX_SECONDS,
+        )
+        print()
+        print(format_horizons_table(horizons))
+        saved = save_horizons(horizons)
+        print(f"  Wrote {saved}")
+
     # Get unique dates for k-fold (use the combined window set)
     all_dates = sorted(set(
         w["close_time"].strftime("%Y-%m-%d") if hasattr(w["close_time"], "strftime")
@@ -1486,6 +1823,9 @@ def main():
     print("\n[3/4] Optimizing (walk-forward cross-validation)...")
     results = {}
     for cell in all_cells:
+        if CELL_FILTER and cell not in CELL_FILTER:
+            print(f"\n--- {cell} --- (skipped by CELL_FILTER)")
+            continue
         print(f"\n--- {cell} ---")
         # pop() (not []) so once this cell's tensors are on the GPU the
         # raw-tick memory for this cell can be reclaimed by the next gc —
@@ -1565,10 +1905,13 @@ def main():
             candidates[0].setdefault("vol_lookback", VOL_LOOKBACK)
             candidates[0].setdefault("max_realized_vol_pct", None)
         else:
-            candidates = grid_params()
+            cell_max_secs = horizons.get(cell, {}).get("max_seconds", DEFAULT_MAX_SECONDS)
+            print(f"    max_seconds cap: {cell_max_secs}s "
+                  f"(from {'default' if horizons.get(cell, {}).get('from_default') else 'data'})")
+            candidates = grid_params(max_seconds_cap=cell_max_secs)
             n_random = int(os.environ.get("N_RANDOM", "50000"))
             for _ in range(n_random):
-                candidates.append(sample_params())
+                candidates.append(sample_params(max_seconds_cap=cell_max_secs))
 
         unique_dates = sorted(set(pp["_date"] for pp in preprocessed))
         N = len(unique_dates)
@@ -1677,7 +2020,13 @@ def main():
                 batch_size = int(os.environ.get("CUDA_BATCH_SIZE", "2048"))
                 print(f"    [cuda] building cell tensors for {len(pp_by_bucket)} folds...")
                 t_build = time.time()
-                cell_tensors = orc.build_cell_tensors(pp_by_bucket, train_sets)
+                # Pass maker_timeouts only in maker mode so the CUDA
+                # build materializes the forward-window ask/bid tensors.
+                # Taker runs skip that memory + build-time cost.
+                _mto = MAKER_TIMEOUTS if ORDER_MODE == "maker" else ()
+                cell_tensors = orc.build_cell_tensors(
+                    pp_by_bucket, train_sets, maker_timeouts=_mto,
+                )
                 print(f"    [cuda] built in {time.time() - t_build:.1f}s "
                       f"(E={cell_tensors['E']:,} entries, W={cell_tensors['W']:,} windows)")
 
@@ -1764,6 +2113,15 @@ def main():
             # Low-trade discount
             if trades < 20:
                 score *= trades / 20.0
+            # Risk-tolerance volume bonus. RISK_TOLERANCE>0 scales
+            # profit-positive candidates by (1 + RISK_TOLERANCE *
+            # norm_trades), pushing the optimizer toward higher-volume
+            # strategies among viable (positive-pnl) candidates. For
+            # losing candidates it leaves `score` unchanged so we don't
+            # accidentally reward losing-but-high-volume params.
+            if score > 0 and RISK_TOLERANCE > 0 and TRADE_VOL_NORM > 0:
+                norm_t = min(1.0, trades / TRADE_VOL_NORM)
+                score *= (1.0 + RISK_TOLERANCE * norm_t)
             return score
 
         candidate_scores.sort(key=lambda x: -_composite(x))

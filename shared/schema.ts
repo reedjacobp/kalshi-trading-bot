@@ -146,6 +146,12 @@ export const tickDataSchema = z.object({
       vol_gate: z.number().nullable().optional(),
       cv_wr: z.number().nullable(),
       cv_trades: z.number(),
+      // Cell-level safety gate. `enabled=false` means the scanner bumps
+      // no_cell for every ticker in this cell regardless of price/buffer,
+      // so the per-trade gates are not evaluated. `disabled_reason` is a
+      // short human string explaining which CV threshold failed.
+      enabled: z.boolean().optional(),
+      disabled_reason: z.string().nullable().optional(),
     })),
   }).optional(),
   recent_skips: z.array(z.object({
